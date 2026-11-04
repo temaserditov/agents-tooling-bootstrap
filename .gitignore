@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+settings.json
+.env*
+*.log
+report.md
+integration-backups/
+index-context/
+models/
+browser-profile*/

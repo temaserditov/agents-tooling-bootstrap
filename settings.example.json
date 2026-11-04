@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "database": {"host": "127.0.0.1", "port": 5432, "name": "agents_student_kb", "user": "agents_student"},
+  "ollamaUrl": "http://127.0.0.1:11434",
+  "embeddingModel": "bge-m3",
+  "embeddingDimensions": 1024,
+  "embeddingDigest": "",
+  "roots": [],
+  "secretMap": {}
+}

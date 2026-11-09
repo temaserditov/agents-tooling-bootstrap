@@ -86,12 +86,19 @@ def prepare(hermes_home,settings,via_vault=False,initial_index=False,enable_brow
         if 'student-agent-kb' in servers and servers['student-agent-kb']!=entry:
             raise ValueError('Existing student-agent-kb configuration differs; preserve it')
         servers['student-agent-kb']=entry
+        own_profile=str(folder/'browser-profile-tooling')
+        browser=current.get('browser')
+        if isinstance(browser,dict) and browser.get('persistent_profile_path')==own_profile:
+            # v2026.11.04.1 wrote a key no Hermes version reads; drop only our own value.
+            del browser['persistent_profile_path']
         if enable_browser:
             browser=current.setdefault('browser',{})
             if not isinstance(browser,dict):raise ValueError('Unexpected browser config')
             browser['headed']=False
-            if not browser.get('persistent_profile_path'):
-                browser['persistent_profile_path']=str(folder/'browser-profile-tooling')
+            # Hermes 0.23+ browser_exec keeps a persistent Chromium profile in
+            # browser.user_data_dir; older Hermes has no config key for it.
+            if state['browserMode']=='hermes-chromium' and not browser.get('user_data_dir'):
+                browser['user_data_dir']=own_profile
         changes[config_path]=yaml.safe_dump(current,allow_unicode=True,sort_keys=False).encode()
         addition=f'''{BEGIN}
 ## Дополнительные инструменты моей установки
@@ -139,7 +146,11 @@ def prepare(hermes_home,settings,via_vault=False,initial_index=False,enable_brow
                 if original is None:path.unlink()
                 else:path.write_bytes(original);path.chmod(0o600)
             raise
-    result={'profiles':names,'registeredRoots':len(roots),'changedFiles':len(plan),
+    # A registered server is useless while the Hermes venv lacks the MCP client.
+    result={'profiles':names,'hermesVersion':state['hermesVersion'],'browserMode':state['browserMode'],
+            'hermesMcpClient':state.get('hermesMcpClient'),
+            'nextSteps':(['hermes pm install --extra mcp'] if state.get('hermesMcpClient') is False else []),
+            'registeredRoots':len(roots),'changedFiles':len(plan),
             'backup':str(backup) if plan else None,'gatewayReloadRequired':bool(plan),'telegramReaderChanged':False}
     if initial_index:
         result['index']=tools.index(tools.config(settings))

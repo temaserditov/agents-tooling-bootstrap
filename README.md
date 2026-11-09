@@ -16,14 +16,15 @@ Codex получает пакет с закреплённым SHA-256, пров�
 
 ## Состав
 
-- inventory.py — обнаружение ОС, команд и профилей, без чтения авторизации;
+- inventory.py — обнаружение ОС, версии Hermes, команд и профилей, без чтения авторизации;
 - bootstrap.py — автоматическая регистрация полученных скиллов/справок/контекста,
   добавление MCP и первое индексирование без замены других подключений;
 - student_tools.py — локальные embeddings, PostgreSQL/pgvector, гибридный поиск,
   stdio MCP, индексатор/watch, offline Whisper consumer и Bitwarden consumer;
 - schema.sql — основа новой собственной базы с vector(1024), не дамп чужой БД;
 - requirements*.lock — закреплённые зависимости с хешами;
-- browser-smoke.py — отдельный headless профиль и синтетическая страница;
+- browser-smoke.py — отдельный headless профиль и синтетическая страница: на Hermes 0.23+
+  через собственный Chromium Hermes, на старых версиях через agent-browser;
 - FOR-CODEX.md — полный порядок, безопасность и критерии приёмки.
 
 Telegram Reader исключён и не переавторизуется. Пакет не повышает тариф,
@@ -36,6 +37,9 @@ Telegram Reader исключён и не переавторизуется. Па�
 `AGENTS_TOOLING_SOURCE=. python -B tests/test_tooling_addon.py` проверяет чистые
 функции и настоящий stdio MCP. Флаг `--postgres` поднимает отдельный временный
 PostgreSQL cluster с pgvector; рабочие БД не использует.
+
+Hermes 0.21–0.22 и 0.23 поддерживаются: в 0.23 нет agent-browser, браузер — собственный
+Chromium Hermes (`hermes pm install chromium`), постоянный профиль — `browser.user_data_dir`.
 
 Проверены синтетические сценарии на macOS. Полный ASR, установка программ и
 Windows/Ubuntu требуют реальной приёмки целевого устройства; не считать их

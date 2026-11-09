@@ -53,6 +53,54 @@ class PureHelpers(unittest.TestCase):
             self.assertEqual(module.prepare(home,settings)['changedFiles'],0)
             self.assertEqual((folder/'auth.json').read_text(),'DO_NOT_READ_OR_COPY')
 
+    def test_browser_profile_key_follows_hermes_version(self):
+        spec=importlib.util.spec_from_file_location('tooling_bootstrap_browser',ADDON/'bootstrap.py')
+        module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+        import yaml
+        cases={'0.23.0':('stamp','hermes-chromium'),'0.21.5':('pyproject','agent-browser'),None:(None,'unknown')}
+        for version,(source,mode) in cases.items():
+            with self.subTest(version=version),tempfile.TemporaryDirectory() as tmp:
+                root=Path(tmp).resolve();home=root/'hermes';folder=home/'profiles/tech';folder.mkdir(parents=True)
+                agent=home/'hermes-agent';agent.mkdir()
+                if source=='stamp':
+                    (agent/'install-stamp.json').write_text(json.dumps({'baseVersion':version}))
+                    (agent/'pyproject.toml').write_text('[project]\nname = "hermes-agent"\nversion = "0.0.0"\n')
+                elif source=='pyproject':
+                    (agent/'pyproject.toml').write_text('[project]\nname = "hermes-agent"\nversion = "%s"\n'%version)
+                else:(agent/'pyproject.toml').write_text('[project]\nname = "hermes-agent"\nversion = "0.0.0"\n')
+                stale=str(folder/'browser-profile-tooling')
+                (folder/'config.yaml').write_text(yaml.safe_dump({'browser':{'headed':True,'persistent_profile_path':stale,'engine':'auto'}}))
+                settings=root/'tooling/settings.json';settings.parent.mkdir()
+                settings.write_text((ADDON/'settings.example.json').read_text())
+                result=module.prepare(home,settings,enable_browser=True)
+                self.assertEqual(result['browserMode'],mode);self.assertEqual(result['hermesVersion'],version)
+                browser=yaml.safe_load((folder/'config.yaml').read_text())['browser']
+                self.assertIs(browser['headed'],False);self.assertEqual(browser['engine'],'auto')
+                self.assertNotIn('persistent_profile_path',browser)
+                if mode=='hermes-chromium':self.assertEqual(browser['user_data_dir'],stale)
+                else:self.assertNotIn('user_data_dir',browser)
+                self.assertEqual(module.prepare(home,settings,enable_browser=True)['changedFiles'],0)
+
+    def test_browser_user_choices_are_preserved(self):
+        spec=importlib.util.spec_from_file_location('tooling_bootstrap_keep',ADDON/'bootstrap.py')
+        module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+        import yaml
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp).resolve();home=root/'hermes';folder=home/'profiles/tech';folder.mkdir(parents=True)
+            (home/'hermes-agent').mkdir();(home/'hermes-agent/install-stamp.json').write_text('{"baseVersion":"0.23.0"}')
+            mine={'user_data_dir':str(root/'my-profile'),'persistent_profile_path':'/elsewhere'}
+            (folder/'config.yaml').write_text(yaml.safe_dump({'browser':dict(mine)}))
+            settings=root/'tooling/settings.json';settings.parent.mkdir()
+            settings.write_text((ADDON/'settings.example.json').read_text())
+            module.prepare(home,settings,enable_browser=True)
+            browser=yaml.safe_load((folder/'config.yaml').read_text())['browser']
+            self.assertEqual(browser['user_data_dir'],mine['user_data_dir'])
+            self.assertEqual(browser['persistent_profile_path'],'/elsewhere')
+            # Without --enable-headless-config the browser section is untouched.
+            (folder/'config.yaml').write_text(yaml.safe_dump({'browser':{'headed':True}}))
+            module.prepare(home,settings)
+            self.assertEqual(yaml.safe_load((folder/'config.yaml').read_text())['browser'],{'headed':True})
+
     def test_chunks_no_loss_and_bounded(self):
         text='Привет, мир! '*1000
         parts=tools.chunks(text)

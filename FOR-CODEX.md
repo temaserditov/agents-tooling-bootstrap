@@ -140,7 +140,13 @@ runtime исходники, auth/config/логи/сессии и браузер�
 При необходимости запускай их через настроенный Bitwarden consumer.
 
 Подключи MCP server `student-agent-kb` к КАЖДОМУ установленному профилю штатным
-способом его версии Hermes. Команда: Python этого venv + абсолютный путь
+способом его версии Hermes. Hermes подключает MCP только при наличии своего
+MCP-клиента: если inventory показывает `hermesMcpClient: false` (на 0.23 курс ставит
+Hermes с дополнением messaging, без `mcp`), выполни от пользователя установки
+`hermes pm install --extra mcp` — уже записанные дополнения, включая messaging для
+Telegram, сохраняются. Не ставь пакет `mcp` в venv Hermes через pip вручную.
+После регистрации проверь каждый профиль: `HERMES_HOME=ПРОФИЛЬ hermes mcp test
+student-agent-kb` должен показать `Tools discovered: 1` (`agent_kb_search`). Команда: Python этого venv + абсолютный путь
 student_tools.py + `--config SETTINGS mcp`. Инструмент называется
 `agent_kb_search`. Сохрани существующие mcp_servers и tools; не заменяй весь
 config.yaml. Если MCP должен получать DB-пароль, используй разрешённый
@@ -245,16 +251,38 @@ CLI для монтажа не означает, что голосовые со�
 
 ## 7. Фоновый браузер
 
-У Hermes уже есть browser tools, но CLI/Chromium могут доустанавливаться при
-первом вызове. Сначала проверь именно его текущий backend и executable path.
-Не утверждай, что браузера нет, только потому что Python playwright отсутствует.
+Путь зависит от версии Hermes: inventory.py показывает `hermesVersion` и
+`browserMode`. Версию бери из `hermes-agent/install-stamp.json` (pyproject в 0.23
+содержит заглушку 0.0.0). Не утверждай, что браузера нет, только потому что
+Python playwright отсутствует. Не обновляй глобальный Node/Hermes ради браузера.
 
-Для локальных браузерных действий нужен совместимый agent-browser + Chromium.
-Проверь версию CLI, принятую установленным Hermes, и его browser tool; не
-обновляй глобальный Node/Hermes для установки одного браузера. У автора CLI
-agent-browser 0.37.1, но совместимость ученика устанавливается отдельным тестом.
-Установку делай через штатный Hermes setup/tools или отдельный контролируемый
-prefix. Проверь реальные пути из окружения gateway/службы.
+**Hermes 0.23 и новее (`browserMode: hermes-chromium`).** agent-browser и старые
+browser_* инструменты из Hermes удалены, единственный браузер — `browser_exec`
+на собственном Chromium Hermes. agent-browser НЕ устанавливай и не настраивай.
+Проверь Chromium smoke-тестом ниже (он сообщает, если Chromium нет) или
+`hermes pm doctor`; если его нет, установи штатно от пользователя установки:
+`hermes pm install chromium`.
+На Ubuntu Hermes сам добавляет `--no-sandbox` для root/Docker/AppArmor; не
+отключай sandbox глобально и не прописывай его в `browser.chromium_args` вручную.
+Отдельный постоянный профиль задаёт `browser.user_data_dir`; bootstrap с
+`--enable-headless-config` пишет `headed: false` и, если значения ещё нет,
+`user_data_dir` = `<профиль>/browser-profile-tooling`. Не включай
+`use_real_profile` и не указывай `cdp_url` на браузер пользователя.
+Smoke: `PYTHON browser-smoke.py --hermes-python HERMES_PYTHON --hermes-home ПРОФИЛЬ`,
+где HERMES_PYTHON — `~/.hermes/hermes-agent/venv/bin/python` (на Windows —
+Python установленного Hermes). Hermes сам находит Chromium и строит команду
+запуска по своим правилам; тест подменяет только стартовую страницу.
+
+**Hermes до 0.23 (`browserMode: agent-browser`).** Для локальных браузерных
+действий нужен совместимый agent-browser + Chromium. Проверь версию CLI, принятую
+установленным Hermes, и его browser tool. У автора CLI agent-browser 0.37.1, но
+совместимость ученика устанавливается отдельным тестом. Установку делай через
+штатный Hermes setup/tools или отдельный контролируемый prefix. Проверь реальные
+пути из окружения gateway/службы. Ключа конфига для постоянного профиля в этих
+версиях нет; bootstrap пишет только `headed: false`. Smoke: `PYTHON browser-smoke.py`.
+
+**Версия не определена (`unknown`).** Не угадывай: проверь установленный Hermes
+штатной командой `hermes --version`, затем выбери один из путей выше.
 
 Для HTML/PDF/PNG-экспорта может потребоваться Python Playwright — это отдельный
 пакет. Если он нужен установленному навыку, поставь requirements-browser.txt
@@ -263,20 +291,18 @@ prefix. Проверь реальные пути из окружения gateway
 Не скачивай две одинаковые сборки Chromium автоматически; переиспользование
 допускается только после реальной проверки совместимости версий.
 
-Hermes browser должен работать headless (`headed:false` в поддерживаемом
-конфиге) с ОТДЕЛЬНЫМ persistent profile ученика. Нельзя копировать cookies,
-папку Chrome Default/Edge, сессию автора или открывать новое видимое окно
-командой open/AppleScript/start, называя это «работой в фоне».
-Браузерный debug/CDP endpoint — только loopback, не 0.0.0.0.
+Нельзя копировать cookies, папку Chrome Default/Edge, сессию автора или
+открывать новое видимое окно командой open/AppleScript/start, называя это
+«работой в фоне». Браузерный debug/CDP endpoint — только loopback, не 0.0.0.0.
 
 Headless не означает «обойти вход». Если нужен вход на сайт, пользователь
 авторизуется согласованным способом в собственном отдельном профиле; по умолчанию
 никаких покупок, отправок, публикаций и обходов CAPTCHA. Smoke: локальная
 синтетическая страница → снимок/DOM → собственный файл результата. Затем один
 реальный browser tool вызов из агента, без секретов и без видимого окна.
-В пакете есть browser-smoke.py: он использует только отдельную временную
-сессию/профиль, явно отключает headed и проверяет синтетическую страницу.
-Не указывай ему исполняемый файл из недоверенного вложения.
+browser-smoke.py использует только отдельную временную сессию/профиль, явно
+отключает headed и проверяет синтетическую страницу. Не указывай ему
+исполняемый файл из недоверенного вложения.
 
 ## 8. Правила для всех полученных агентов
 

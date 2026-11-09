@@ -8,6 +8,7 @@ from pathlib import Path
 import platform
 import re
 import shutil
+import subprocess
 
 PROFILES=('marketer','copywriter','designer','editor','tech','assistant','sales')
 COMMANDS=('hermes','node','npm','uv','ffmpeg','ffprobe','yt-dlp','tesseract',
@@ -39,13 +40,21 @@ def hermes_version(root):
 
 
 def hermes_mcp_client(root):
-    """True/False: the installed Hermes venv carries the MCP client (0.23: the `mcp` extra)."""
+    """True/False: the installed Hermes interpreter can import the MCP client, None if unknown.
+
+    Hermes 0.23 keeps its packages in a PM store (~/.hermes/installs/...); venv/bin/python
+    is only a launcher, so ask that interpreter instead of looking for files.
+    """
     root=Path(root)
     for source in (root/'hermes-agent',root.parent/'hermes-agent'):
-        venv=source/'venv'
-        if source.is_symlink() or not venv.is_dir():continue
-        found=[*venv.glob('lib/python3*/site-packages/mcp-*.dist-info'),*venv.glob('Lib/site-packages/mcp-*.dist-info')]
-        return bool(found)
+        if source.is_symlink():continue
+        for python in (source/'venv/bin/python',source/'venv/Scripts/python.exe'):
+            if not python.is_file():continue
+            try:
+                probe=subprocess.run([str(python),'-I','-c','import importlib.util,sys;sys.exit(0 if importlib.util.find_spec("mcp") else 3)'],
+                                     capture_output=True,timeout=60)
+            except (OSError,subprocess.SubprocessError):return None
+            return True if probe.returncode==0 else False if probe.returncode==3 else None
     return None
 
 

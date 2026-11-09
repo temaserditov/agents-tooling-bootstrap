@@ -81,6 +81,18 @@ class PureHelpers(unittest.TestCase):
                 else:self.assertNotIn('user_data_dir',browser)
                 self.assertEqual(module.prepare(home,settings,enable_browser=True)['changedFiles'],0)
 
+    @unittest.skipIf(os.name=='nt','POSIX launcher fixture')
+    def test_mcp_client_is_asked_from_the_hermes_interpreter(self):
+        spec=importlib.util.spec_from_file_location('tooling_inventory',ADDON/'inventory.py')
+        module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as tmp:
+            home=Path(tmp).resolve()/'hermes';launcher=home/'hermes-agent/venv/bin/python';launcher.parent.mkdir(parents=True)
+            self.assertIsNone(module.hermes_mcp_client(home))
+            # 0.23: no venv/lib at all, packages live in the PM store behind this launcher.
+            for code,expected in ((0,True),(3,False),(1,None)):
+                launcher.write_text('#!/bin/sh\nexit %d\n'%code);launcher.chmod(0o755)
+                self.assertIs(module.hermes_mcp_client(home),expected)
+
     def test_browser_user_choices_are_preserved(self):
         spec=importlib.util.spec_from_file_location('tooling_bootstrap_keep',ADDON/'bootstrap.py')
         module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)

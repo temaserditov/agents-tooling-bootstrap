@@ -3,7 +3,8 @@
 
 Hermes 0.23+ (``--hermes-python``): Hermes resolves its own Chromium and builds the
 launch command with its own rules (sandbox policy for root/Docker included); the
-test only swaps the start page for a synthetic one. Older Hermes: agent-browser.
+test opens a synthetic page over the DevTools port that launch opens, as Hermes does.
+Older Hermes: agent-browser.
 """
 import argparse
 import json
@@ -12,6 +13,9 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import time
+import urllib.parse
+import urllib.request
 import uuid
 
 PAGE='data:text/html,<title>Agents tooling smoke</title><h1>Fixture</h1>'
@@ -34,9 +38,27 @@ def isolated_env(root):
     return env
 
 
+def cdp_page_title_ok(port_file,proc,deadline=60):
+    """Open the synthetic page through the local DevTools endpoint and read its title back."""
+    end=time.monotonic()+deadline
+    while time.monotonic()<end and proc.poll() is None:
+        if port_file.is_file() and port_file.read_text().strip():break
+        time.sleep(0.5)
+    else:return False
+    base='http://127.0.0.1:'+port_file.read_text().split()[0]
+    opener=urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    page=urllib.parse.quote(PAGE,safe=':,/')
+    opener.open(urllib.request.Request(base+'/json/new?'+page,method='PUT'),timeout=10).read()
+    while time.monotonic()<end and proc.poll() is None:
+        pages=json.loads(opener.open(base+'/json/list',timeout=10).read())
+        if any(x.get('type')=='page' and x.get('title')=='Agents tooling smoke' for x in pages):return True
+        time.sleep(0.5)
+    return False
+
+
 def hermes_smoke(python,hermes_home):
     if not Path(python).is_file():raise ValueError('Hermes Python missing')
-    with tempfile.TemporaryDirectory(prefix='hb-',dir='/tmp' if os.name!='nt' else None) as tmp:
+    with tempfile.TemporaryDirectory(prefix='hb-',dir='/tmp' if os.name!='nt' else None,ignore_cleanup_errors=True) as tmp:
         root=Path(tmp).resolve();profile=root/'profile'
         env={**isolated_env(root),'HERMES_HOME':str(Path(hermes_home).resolve())}
         if 'HOME' in os.environ:env['HOME']=os.environ['HOME']  # pm's Chromium store lives under the real home
@@ -47,10 +69,17 @@ def hermes_smoke(python,hermes_home):
         argv=data['argv']
         if '--headless=new' not in argv or not any(a=='--user-data-dir='+str(profile) for a in argv):
             raise ValueError('Unexpected Hermes launch plan')
-        argv=[a for a in argv[:-1] if not a.startswith('--remote-debugging-port')]+['--dump-dom',PAGE]
-        result=subprocess.run(argv,env=env,capture_output=True,timeout=90)
-        if result.returncode or b'Agents tooling smoke' not in result.stdout:
-            raise ValueError('Isolated headless Chromium check failed; raw output suppressed')
+        # Same launch as Hermes, driven the same way: over the DevTools port it opens.
+        # (--dump-dom hangs on macOS sessions without a window server.)
+        if not any(a.startswith('--remote-debugging-port') for a in argv):argv=[argv[0],'--remote-debugging-port=0',*argv[1:]]
+        proc=subprocess.Popen(argv,env=env,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        try:
+            if not cdp_page_title_ok(profile/'DevToolsActivePort',proc):
+                raise ValueError('Isolated headless Chromium check failed; raw output suppressed')
+        finally:
+            proc.terminate()
+            try:proc.wait(timeout=20)
+            except subprocess.TimeoutExpired:proc.kill();proc.wait(timeout=10)
         return {'headless':True,'isolatedProfile':True,'syntheticPageVerified':True,'browser':'hermes-chromium'}
 
 

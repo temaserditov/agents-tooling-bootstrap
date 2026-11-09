@@ -132,6 +132,33 @@ class PureHelpers(unittest.TestCase):
             module.prepare(home,settings)
             self.assertEqual(yaml.safe_load((folder/'config.yaml').read_text())['browser'],{'headed':True})
 
+    def test_hermes_browser_check_reads_the_page_back_over_devtools(self):
+        import http.server,threading
+        spec=importlib.util.spec_from_file_location('browser_smoke',ADDON/'browser-smoke.py')
+        smoke=importlib.util.module_from_spec(spec);spec.loader.exec_module(smoke)
+        opened=[]
+        class DevTools(http.server.BaseHTTPRequestHandler):
+            def log_message(self,*a):pass
+            def reply(self,body):
+                data=json.dumps(body).encode();self.send_response(200);self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
+            def do_PUT(self):
+                opened.append(self.path);self.reply({'id':'1','type':'page','title':''})
+            def do_GET(self):
+                self.reply([{'type':'page','title':'Agents tooling smoke' if opened else 'about:blank'}])
+        server=http.server.HTTPServer(('127.0.0.1',0),DevTools);threading.Thread(target=server.serve_forever,daemon=True).start()
+        class Alive:
+            def poll(self):return None
+        class Gone:
+            def poll(self):return 1
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                port=Path(tmp)/'DevToolsActivePort';port.write_text(str(server.server_port)+'\n/devtools/browser/x\n')
+                self.assertTrue(smoke.cdp_page_title_ok(port,Alive(),deadline=10))
+                self.assertTrue(opened[0].startswith('/json/new?data:text/html,'))
+                # A browser that exits before it opens its DevTools port fails the check.
+                self.assertFalse(smoke.cdp_page_title_ok(Path(tmp)/'missing',Gone(),deadline=5))
+        finally:server.shutdown()
+
     def test_chunks_no_loss_and_bounded(self):
         text='Привет, мир! '*1000
         parts=tools.chunks(text)

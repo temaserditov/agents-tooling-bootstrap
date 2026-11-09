@@ -93,6 +93,25 @@ class PureHelpers(unittest.TestCase):
                 launcher.write_text('#!/bin/sh\nexit %d\n'%code);launcher.chmod(0o755)
                 self.assertIs(module.hermes_mcp_client(home),expected)
 
+    def test_unreadable_instruction_file_is_skipped_not_fatal(self):
+        spec=importlib.util.spec_from_file_location('tooling_bootstrap_bytes',ADDON/'bootstrap.py')
+        module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+        import yaml
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp).resolve();home=root/'hermes'
+            for name in ('tech','assistant'):
+                folder=home/'profiles'/name;folder.mkdir(parents=True)
+                (folder/'AGENTS.md').write_text('# '+name+'\nCourse text.\n');(folder/'config.yaml').write_text(yaml.safe_dump({}))
+            broken=home/'profiles/assistant/SOUL.md';raw=b'\xff\xfe\x00broken'+bytes(range(128,160));broken.write_bytes(raw)
+            settings=root/'tooling/settings.json';settings.parent.mkdir()
+            settings.write_text((ADDON/'settings.example.json').read_text())
+            result=module.prepare(home,settings)
+            self.assertEqual(result['unreadableInstructions'],['assistant/SOUL.md'])
+            self.assertEqual(broken.read_bytes(),raw)
+            for name in ('tech','assistant'):
+                self.assertEqual((home/'profiles'/name/'AGENTS.md').read_text().count(module.BEGIN),1)
+                self.assertIn('student-agent-kb',yaml.safe_load((home/'profiles'/name/'config.yaml').read_text())['mcp_servers'])
+
     def test_browser_user_choices_are_preserved(self):
         spec=importlib.util.spec_from_file_location('tooling_bootstrap_keep',ADDON/'bootstrap.py')
         module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)

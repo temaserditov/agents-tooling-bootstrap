@@ -30,6 +30,16 @@ def safe(path):
     return path
 
 
+def readable(path):
+    """UTF-8 text of an instruction file, or None when its bytes are not UTF-8.
+
+    Such a file is the student's own and stays untouched; one broken file must not
+    stop the other profiles from receiving the tooling.
+    """
+    try:return path.read_text(encoding='utf8')
+    except UnicodeDecodeError:return None
+
+
 def block(text,addition):
     if BEGIN in text or END in text:
         if text.count(BEGIN)!=1 or text.count(END)!=1 or text.index(BEGIN)>text.index(END):
@@ -59,7 +69,7 @@ def prepare(hermes_home,settings,via_vault=False,initial_index=False,enable_brow
         spec=importlib.util.spec_from_file_location('student_tools',HERE/'student_tools.py')
         tools=importlib.util.module_from_spec(spec);spec.loader.exec_module(tools)
         tools.doctor(tools.config(settings))
-    changes={};roots=list(cfg.get('roots',[]));names=[]
+    changes={};roots=list(cfg.get('roots',[]));names=[];unreadable=[]
     entry={'command':sys.executable,'args':['-B',str(HERE/'student_tools.py'),'--config',str(settings),'vault-mcp' if via_vault else 'mcp']}
     for profile in state['profiles']:
         name=profile['id'];names.append(name);folder=Path(profile['path'])
@@ -72,7 +82,10 @@ def prepare(hermes_home,settings,via_vault=False,initial_index=False,enable_brow
         texts=[]
         for filename in BRAIN_FILES:
             path=safe(folder/filename)
-            if path.is_file():texts.append((filename,path.read_text(encoding='utf8')))
+            if path.is_file():
+                text=readable(path)
+                if text is None:unreadable.append(name+'/'+filename)
+                else:texts.append((filename,text))
         if texts:
             # Only existing approved instruction text, never runtime/auth/config.
             changes[snapshot/'profile-context.md']=('\n\n'.join('# '+n+'\n\n'+without_block(t) for n,t in texts)+'\n').encode()
@@ -116,7 +129,8 @@ def prepare(hermes_home,settings,via_vault=False,initial_index=False,enable_brow
 {END}'''
         for filename in ['AGENTS.md','SOUL.md']:
             path=safe(folder/filename)
-            if path.is_file():changes[path]=block(path.read_text(encoding='utf8'),addition).encode()
+            text=readable(path) if path.is_file() else None
+            if text is not None:changes[path]=block(text,addition).encode()
     cfg['roots']=roots;changes[settings]=(json.dumps(cfg,ensure_ascii=False,indent=2)+'\n').encode()
     # Validate every destination before writing any of them.
     plan={safe(p):body for p,body in changes.items() if not p.is_file() or p.read_bytes()!=body}
@@ -151,6 +165,7 @@ def prepare(hermes_home,settings,via_vault=False,initial_index=False,enable_brow
             'hermesMcpClient':state.get('hermesMcpClient'),
             'nextSteps':(['hermes pm install --extra mcp'] if state.get('hermesMcpClient') is False else []),
             'registeredRoots':len(roots),'changedFiles':len(plan),
+            'unreadableInstructions':sorted(set(unreadable)),
             'backup':str(backup) if plan else None,'gatewayReloadRequired':bool(plan),'telegramReaderChanged':False}
     if initial_index:
         result['index']=tools.index(tools.config(settings))

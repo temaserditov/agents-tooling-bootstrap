@@ -1,0 +1,145 @@
+# One manual Windows x64 acceptance of the tooling package on official Hermes 0.23.0.
+# Owner rule: GitHub runners only for Windows x64 and only when really needed; never ARM.
+name: Windows tooling x64
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  tooling:
+    name: windows-2025-hermes-0.23.0-tooling
+    runs-on: windows-2025
+    timeout-minutes: 80
+    env:
+      HERMES_SHA: 2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19
+      HERMES_INSTALLER_SHA256: ed5769c269e001eace6a67ad07fb3a02d62e0402345bc5d963d58524b14b5115
+      OLLAMA_TAG: v0.40.11
+      OLLAMA_ZIP_SHA256: bda4a493ba8a7c24d57263cd843cd68cee84f44aed4299eeed532acad7eda12a
+      PGVECTOR_SHA: f37c13f68b57d2c3472b2214fbcff699d6d34876
+      AGENTS_TOOLING_QA_MAX_FILES: '3'
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Official Hermes 0.23.0 with the reviewed installer (newline-normalized pin)
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $path=Join-Path $env:RUNNER_TEMP 'official-hermes-install.ps1'
+          $url="https://raw.githubusercontent.com/NousResearch/hermes-agent/$env:HERMES_SHA/scripts/install.ps1"
+          for($i=1;$i -le 4;$i++){try{Invoke-WebRequest -UseBasicParsing $url -OutFile $path -TimeoutSec 60;break}catch{if($i -eq 4){throw};Start-Sleep -Seconds (10*$i)}}
+          # GitHub raw serves LF; the reviewed pin is the CRLF form of the same file.
+          $text=[Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($path)).Replace("`r`n","`n").Replace("`n","`r`n")
+          $bytes=[Text.Encoding]::UTF8.GetBytes($text)
+          $hasher=[Security.Cryptography.SHA256]::Create();$actual=([BitConverter]::ToString($hasher.ComputeHash($bytes))).Replace('-','').ToLowerInvariant();$hasher.Dispose()
+          if($actual -ne $env:HERMES_INSTALLER_SHA256){throw "Official installer SHA256 mismatch: $actual"}
+          Remove-Item -LiteralPath $path -Force
+          & ([scriptblock]::Create($text)) -Commit $env:HERMES_SHA -NonInteractive -SkipBrowser -SkipComputerUse
+          if($LASTEXITCODE){exit $LASTEXITCODE}
+          $hermes=Join-Path $env:LOCALAPPDATA 'hermes\bin\hermes.exe'
+          if(-not (Test-Path -LiteralPath $hermes)){$hermes=(Get-Command hermes -ErrorAction Stop).Source}
+          $version=(& $hermes --version 2>&1|Out-String);$version
+          if($version -notmatch 'v0\.23\.0'){throw 'Hermes is not 0.23.0'}
+      - name: Course-like profiles (synthetic; Windows v3 itself is not installed here)
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $root=Join-Path $env:LOCALAPPDATA 'hermes\profiles'
+          foreach($p in 'tech','copywriter'){
+            $dir=Join-Path $root $p
+            New-Item -ItemType Directory -Force -Path (Join-Path $dir 'skills\lighthouse\references') | Out-Null
+            Set-Content -LiteralPath (Join-Path $dir 'skills\lighthouse\SKILL.md') -Encoding UTF8 -Value "# Маяк`nНавык про маяк и проверку локального поиска для профиля $p."
+            Set-Content -LiteralPath (Join-Path $dir 'skills\lighthouse\references\note.md') -Encoding UTF8 -Value 'Справка: маяк светит кораблям ночью.'
+            Set-Content -LiteralPath (Join-Path $dir 'AGENTS.md') -Encoding UTF8 -Value "# $p`nЛичное правило ученика."
+            Set-Content -LiteralPath (Join-Path $dir 'SOUL.md') -Encoding UTF8 -Value "# Душа $p"
+            Set-Content -LiteralPath (Join-Path $dir 'config.yaml') -Encoding UTF8 -Value "model:`n  provider: fixture"
+            Set-Content -LiteralPath (Join-Path $dir 'auth.json') -Encoding UTF8 -Value 'CANARY-WINDOWS-SECRET'
+          }
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Tooling venv from the hashed locks; inventory finds official Hermes
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          python -m venv "$env:RUNNER_TEMP\tv"
+          $py="$env:RUNNER_TEMP\tv\Scripts\python.exe"
+          & $py -m pip install -q --disable-pip-version-check --require-hashes -r requirements.lock; if($LASTEXITCODE){exit 1}
+          & $py -m pip install -q --disable-pip-version-check --require-hashes -r requirements-whisper.lock; if($LASTEXITCODE){exit 1}
+          $inv=& $py -B inventory.py | Out-String; $inv | Set-Content "$env:RUNNER_TEMP\inventory.json"
+          $d=$inv|ConvertFrom-Json
+          "INVENTORY hermes=$($d.hermesVersion) browser=$($d.browserMode) profiles=$(($d.profiles|%{$_.id}) -join ',')"
+          if($d.hermesVersion -ne '0.23.0'){throw 'inventory did not find official Hermes 0.23.0'}
+          if(@($d.profiles).Count -ne 2){throw 'inventory did not find the profiles'}
+          if($inv -match 'CANARY-WINDOWS-SECRET'){throw 'inventory leaked a secret'}
+      - name: PostgreSQL 17 cluster with pgvector built from a pinned commit
+        shell: cmd
+        run: |
+          set "PGROOT=C:\Program Files\PostgreSQL\17"
+          git clone -q https://github.com/pgvector/pgvector.git "%RUNNER_TEMP%\pgvector" || exit /b 1
+          git -C "%RUNNER_TEMP%\pgvector" checkout -q %PGVECTOR_SHA% || exit /b 1
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath`) do set "VS=%%i"
+          call "%VS%\VC\Auxiliary\Build\vcvars64.bat" >nul || exit /b 1
+          cd /d "%RUNNER_TEMP%\pgvector" && nmake /nologo /F Makefile.win >nul && nmake /nologo /F Makefile.win install >nul || exit /b 1
+          "%PGROOT%\bin\initdb.exe" -D "%RUNNER_TEMP%\pg" -A trust -U postgres --encoding=UTF8 --no-instructions >nul || exit /b 1
+          "%PGROOT%\bin\pg_ctl.exe" -D "%RUNNER_TEMP%\pg" -l "%RUNNER_TEMP%\pg.log" -o "-h 127.0.0.1 -p 5433" -w start || exit /b 1
+          "%PGROOT%\bin\psql.exe" -h 127.0.0.1 -p 5433 -U postgres -v ON_ERROR_STOP=1 -q -c "CREATE ROLE agents_student LOGIN" -c "CREATE DATABASE agents_student_kb" || exit /b 1
+          "%PGROOT%\bin\psql.exe" -h 127.0.0.1 -p 5433 -U postgres -d agents_student_kb -v ON_ERROR_STOP=1 -q -f schema.sql || exit /b 1
+          "%PGROOT%\bin\psql.exe" -h 127.0.0.1 -p 5433 -U postgres -d agents_student_kb -v ON_ERROR_STOP=1 -q -c "GRANT USAGE ON SCHEMA public TO agents_student; GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA public TO agents_student; GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA public TO agents_student;" || exit /b 1
+      - name: Ollama (pinned release) and the pinned bge-m3
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $zip="$env:RUNNER_TEMP\ollama.zip"
+          $url="https://github.com/ollama/ollama/releases/download/$env:OLLAMA_TAG/ollama-windows-amd64.zip"
+          for($i=1;$i -le 4;$i++){try{Invoke-WebRequest -UseBasicParsing $url -OutFile $zip -TimeoutSec 600;break}catch{if($i -eq 4){throw};Start-Sleep -Seconds (15*$i)}}
+          if((Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:OLLAMA_ZIP_SHA256){throw 'Ollama archive SHA256 mismatch'}
+          Expand-Archive -LiteralPath $zip -DestinationPath "$env:RUNNER_TEMP\ollama" -Force; Remove-Item $zip
+          $env:OLLAMA_HOST='127.0.0.1:11434'
+          Start-Process -FilePath "$env:RUNNER_TEMP\ollama\ollama.exe" -ArgumentList 'serve' -WindowStyle Hidden -RedirectStandardOutput "$env:RUNNER_TEMP\ollama.out" -RedirectStandardError "$env:RUNNER_TEMP\ollama.err"
+          $deadline=(Get-Date).AddSeconds(90);do{try{Invoke-WebRequest -UseBasicParsing http://127.0.0.1:11434/api/tags -TimeoutSec 3|Out-Null;$up=$true}catch{Start-Sleep 2}}until($up -or (Get-Date) -gt $deadline)
+          if(-not $up){throw 'Ollama did not start'}
+          for($i=1;$i -le 3;$i++){& "$env:RUNNER_TEMP\ollama\ollama.exe" pull bge-m3; if($LASTEXITCODE -eq 0){break}; if($i -eq 3){throw 'bge-m3 pull failed'}; Start-Sleep -Seconds (20*$i)}
+      - name: Settings, pinned model check, doctor
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $py="$env:RUNNER_TEMP\tv\Scripts\python.exe";$t="$env:RUNNER_TEMP\tooling";New-Item -ItemType Directory -Force $t|Out-Null
+          $c=Get-Content settings.example.json -Raw|ConvertFrom-Json
+          $c.embeddingDigest='7907646426070047a77226ac3e684fbbe8410524f7b4a74d02837e43f2146bab'
+          $c.database.host='127.0.0.1';$c.database|Add-Member -NotePropertyName port -NotePropertyValue 5433 -Force
+          $c.database.name='agents_student_kb';$c.database.user='agents_student'
+          [IO.File]::WriteAllText("$t\settings.json",($c|ConvertTo-Json -Depth 8))
+          & $py -B student_tools.py --config "$t\settings.json" model-check; if($LASTEXITCODE){exit 1}
+          & $py -B student_tools.py --config "$t\settings.json" doctor; if($LASTEXITCODE){exit 1}
+      - name: Bootstrap with first index, search, then a repeat that changes nothing
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $py="$env:RUNNER_TEMP\tv\Scripts\python.exe";$t="$env:RUNNER_TEMP\tooling";$h=Join-Path $env:LOCALAPPDATA 'hermes'
+          $first=& $py -B bootstrap.py --hermes-home $h --settings "$t\settings.json" --index | Out-String;"BOOTSTRAP1 $first"
+          $r=$first|ConvertFrom-Json; if($r.status -eq 'failed' -or $r.index.documentsWritten -lt 1 -or -not $r.changed){throw 'first bootstrap failed'}
+          $s=& $py -B student_tools.py --config "$t\settings.json" search "маяк кораблям" --profile tech --project __skills__ | Out-String;"SEARCH $($s.Substring(0,[Math]::Min(400,$s.Length)))"
+          if(@(($s|ConvertFrom-Json).results).Count -lt 1){throw 'search found nothing'}
+          $second=& $py -B bootstrap.py --hermes-home $h --settings "$t\settings.json" --index | Out-String;"BOOTSTRAP2 $second"
+          $r2=$second|ConvertFrom-Json; if($r2.changed -ne $false -or $r2.changedFiles -ne 0){throw 'repeat bootstrap changed files'}
+          foreach($p in 'tech','copywriter'){foreach($f in 'AGENTS.md','SOUL.md'){$x=Get-Content -Raw (Join-Path $h "profiles\$p\$f");$n=([regex]::Matches($x,'agents-student-tooling:start')).Count;if($n -ne 1){throw "block $p/$f=$n"};if($f -eq 'AGENTS.md' -and $x -notmatch 'Личное правило ученика'){throw 'personal text lost'}}}
+          Get-ChildItem -Recurse -File $t | ForEach-Object { if((Get-Content -Raw $_.FullName) -match 'CANARY-WINDOWS-SECRET'){throw "secret copied into $($_.FullName)"} }
+          'TOOLING_IDEMPOTENT changed=false, blocks intact, no secrets copied'
+      - name: Pinned Whisper model and offline transcription of a short Russian phrase
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $py="$env:RUNNER_TEMP\tv\Scripts\python.exe";$m="$env:RUNNER_TEMP\models\small"
+          & $py -B student_tools.py fetch-whisper-model --model-dir $m; if($LASTEXITCODE){exit 1}
+          $again=& $py -B student_tools.py fetch-whisper-model --model-dir $m | Out-String; if(($again|ConvertFrom-Json).changed -ne $false){throw 'model fetch not idempotent'}
+          # Offline for real: block outbound traffic of this interpreter while it transcribes.
+          $exe=(& $py -c "import sys;print(sys.executable)").Trim()
+          New-NetFirewallRule -DisplayName 'tooling-offline-asr' -Direction Outbound -Action Block -Program $exe | Out-Null
+          try{$out=& $py -B student_tools.py transcribe --model-dir $m --audio tests\fixtures\ru-phrase.wav --output "$env:RUNNER_TEMP\asr.json" | Out-String}
+          finally{Remove-NetFirewallRule -DisplayName 'tooling-offline-asr'}
+          $asr=Get-Content -Raw -Encoding UTF8 "$env:RUNNER_TEMP\asr.json"|ConvertFrom-Json
+          $text=($asr.segments|%{$_.text}) -join ' ';"ASR language=$($asr.language) text=$text"
+          if($asr.language -ne 'ru' -or $text -notmatch '(?i)распознав' -or $text -notmatch '(?i)интернет'){throw 'unexpected transcript'}

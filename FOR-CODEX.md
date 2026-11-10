@@ -102,7 +102,10 @@ requirements.txt описывает прямые зависимости. Это 
 закреплённым `av`. Затем выполни bootstrap из новой папки: он узнаёт прежнюю
 запись `student-agent-kb` этого пакета (другая папка, другой Python, режим vault)
 и заменяет её с резервной копией; чужую запись с тем же именем не трогает и
-говорит об этом. settings.json перенеси из старой папки (там ID секретов и roots).
+говорит об этом; твои ключи записи (env, timeout, enabled) сохраняются.
+settings.json перенеси из старой папки (там ID секретов и roots), но в `database`
+убери `host` и пароль и укажи `socket` (раздел 4): прежнее TCP-подключение с паролем
+этот выпуск не принимает, а Bitwarden для базы больше не нужен.
 Старую папку и venv удаляй только после проверки поиска у агентов.
 
 ## 3. Bitwarden — собственное хранилище
@@ -117,8 +120,10 @@ bws для этой ОС, помоги мне создать собственн�
 account через штатный интерфейс. У меня могут быть действия входа/2FA; выполняю
 их сам локально. Не проси пароль, access token или session key в переписке.
 
+Базе знаний Bitwarden не нужен: она работает через локальный сокет без пароля
+(раздел 4). Bitwarden — для ключей других сервисов, которые я сам решу подключить.
 settings.json содержит ТОЛЬКО не-секретные параметры и ID записей:
-`secretMap: {"AGENTS_KB_PASSWORD": "UUID_МОЕГО_СЕКРЕТА"}`.
+`secretMap: {"SOME_SERVICE_API_KEY": "UUID_МОЕГО_СЕКРЕТА"}`.
 Значения секретов — только в моём Bitwarden. student_tools.py vault-run
 получает указанные записи через bws в память и передаёт значения процессу
 через environment. BWS_ACCESS_TOKEN не передаётся конечному процессу; вывод
@@ -151,46 +156,43 @@ Keychain/другое хранилище вместо Bitwarden молча. По
 базу `agents_student_kb` и отдельного runtime-пользователя с минимальными правами.
 Не трогай существующие базы и не включай trust для общесистемного TCP.
 
-Порядок (выполняет администратор локальной БД: на Mac — твой пользователь
-Homebrew-PostgreSQL, на Ubuntu — `sudo -u postgres`):
+Агенты подключаются к базе ТОЛЬКО через локальный Unix-сокет PostgreSQL с
+peer-аутентификацией: пароля базы нет, Bitwarden для базы не нужен, TCP (127.0.0.1)
+не используется. Мой ОС-пользователь (от которого работают агенты) отображается на
+отдельную роль `agents_student` через pg_ident.conf.
+
+Порядок (выполняет администратор локальной БД: на Mac — мой пользователь
+Homebrew-PostgreSQL, на Ubuntu — `sudo -u postgres`). SQL-файлы подавай через stdin
+(`psql … < файл`): на Ubuntu postgres не может прочитать файлы из моей домашней папки.
 
 1. `CREATE ROLE agents_student LOGIN;` и `CREATE DATABASE agents_student_kb;` —
    владелец базы администратор, НЕ agents_student; agents_student не superuser,
-   не создаёт роли и базы.
-2. `psql -d agents_student_kb -v ON_ERROR_STOP=1 -f schema.sql` — схема сама откажется
-   выполняться в другой базе. Затем `-f grants.sql`: ровно нужные права (SELECT,
-   INSERT, UPDATE на две таблицы и их последовательности, CONNECT, USAGE), с проверкой
-   владельца и ролей.
-3. Пароль runtime-пользователя. Попроси меня создать в веб-интерфейсе Bitwarden
-   Secrets Manager секрет AGENTS_KB_PASSWORD (сгенерированный пароль от 16 символов)
-   в моём проекте и назвать тебе только его ID (UUID) — значение ты не видишь и не
-   спрашиваешь. Запиши ID в settings.json → `secretMap`. Затем поставь пароль роли
-   без вывода и без аргументов командной строки:
-   ```text
-   PYTHON student_tools.py --config SETTINGS vault-run -- psql -X -q -v ON_ERROR_STOP=1 -h 127.0.0.1 -U ADMIN -d postgres -f set-role-password.sql
-   ```
-   На Ubuntu, где администратор — системный postgres, оберни psql в
-   `sudo --preserve-env=AGENTS_KB_PASSWORD -u postgres psql -X -q -v ON_ERROR_STOP=1 -d postgres -f set-role-password.sql`.
-   set-role-password.sql берёт значение из окружения процесса и ничего не печатает.
-4. В pg_hba.conf для `agents_student_kb`/`agents_student` с 127.0.0.1 — `scram-sha-256`.
-   Homebrew на Mac по умолчанию ставит `trust` для 127.0.0.1: doctor предупредит об этом;
-   смени на scram-sha-256 для этой базы (остальные строки не трогай) и перезапусти
-   PostgreSQL. После этого агенты и индексатор получают пароль только через
-   `vault-mcp`/`vault-run`.
-5. `student_tools.py --config SETTINGS doctor` (через vault-run): проверит имя базы,
-   что runtime-пользователь не суперпользователь и не владелец, права и vector(1024).
+   не создаёт роли и базы, пароля у него нет.
+2. `psql -X -v ON_ERROR_STOP=1 -d agents_student_kb < schema.sql` — схема сама откажется
+   выполняться в другой базе. Затем так же `< grants.sql`: ровно нужные права (SELECT,
+   INSERT, UPDATE на две таблицы, USAGE на их последовательности, CONNECT, USAGE на
+   схему) с проверкой владельца и ролей.
+3. В НАЧАЛО pg_hba.conf (до общих строк `local all …`) добавь одну строку
+   `local agents_student_kb agents_student peer map=agents_student`, а в pg_ident.conf —
+   `agents_student МОЙ_ОС_ПОЛЬЗОВАТЕЛЬ agents_student`. Остальные строки не трогай.
+   Перечитай конфигурацию (`SELECT pg_reload_conf();` от администратора).
+   Путь к файлам — `SHOW hba_file;` и `SHOW ident_file;`.
+4. В settings.json: `database.socket` — папка сокета (Ubuntu: `/var/run/postgresql`,
+   Mac Homebrew: обычно `/tmp`; проверь `SHOW unix_socket_directories;`), `port`,
+   `name: agents_student_kb`, `user: agents_student`. Ни пароля, ни host — config их отвергнет.
+5. `student_tools.py --config SETTINGS doctor`: проверит, что подключение идёт через
+   сокет, имя базы, что agents_student не суперпользователь и не владелец, права на
+   таблицы и последовательности, vector(1024) и embeddings.
 
-Схема сохраняет основу Team KB: team_kb_documents/chunks/migrations, полный
-текст и hash источника, специализацию, проект, provenance, чанки и vector(1024),
-HNSW/лексический индекс. student_tools.py объединяет независимые лексические
-и векторные результаты через RRF, ограничивает дубли и число фрагментов источника.
-Это переносимое ядро нашей схемы, НЕ полный owner memory plugin со всеми его
-персональными ограничениями и карточками исправлений. Не заявляй полную
-эквивалентность этому плагину без отдельного переноса и проверки.
+Если на Mac у Homebrew-PostgreSQL в pg_hba.conf стоит `trust` для всех локальных
+подключений — это настройка самого Homebrew, не этого пакета; скажи мне об этом
+и предложи заменить `trust` на `peer` для локального сокета, ничего не меняя молча.
 
 Ollama должен слушать только loopback. Если Ollama ещё нет — ставь только
 закреплённый выпуск **v0.40.11** с GitHub, сверив SHA-256 до распаковки (не
-`curl | sh` вслепую):
+`curl | sh` вслепую). Для `.tar.zst` на Ubuntu нужен `zstd` (`apt-get install zstd`).
+Место: архив Ollama для Linux ≈ 1,5 ГБ сжатым (внутри библиотеки CUDA/ROCm), после
+распаковки — больше; посчитай по факту `du` до и после и скажи мне.
 
 | ОС | Файл (https://github.com/ollama/ollama/releases/download/v0.40.11/…) | SHA-256 |
 |---|---|---|
@@ -202,7 +204,9 @@ Ollama должен слушать только loopback. Если Ollama ещё
 (`api.github.com/repos/ollama/ollama/releases/tags/v0.40.11`, ассет с
 `Accept: application/octet-stream`), SHA сверяй всегда. Распакуй в папку
 пользователя установки и запусти `ollama serve` управляемой службой с
-`OLLAMA_HOST=127.0.0.1:11434` (LaunchAgent на Mac, systemd на Ubuntu). Уже стоящий
+`OLLAMA_HOST=127.0.0.1:11434` (LaunchAgent на Mac, systemd на Ubuntu). Если на VPS
+это пользовательская служба (`systemctl --user`), включи `loginctl enable-linger
+ПОЛЬЗОВАТЕЛЬ`, иначе она остановится после выхода из SSH; от root — системная служба. Уже стоящий
 Ollama переиспользуй, если он отвечает на loopback.
 
 Скачай bge-m3 командой `ollama pull bge-m3`, если его нет (загрузка по digest Ollama
@@ -226,12 +230,13 @@ digest `7907646426070047a77226ac3e684fbbe8410524f7b4a74d02837e43f2146bab`
 только для намеренно общей папки. Не индексируй целый HOME или весь профиль,
 runtime исходники, auth/config/логи/сессии и браузерные профили.
 
-Сначала выполни `student_tools.py --config SETTINGS doctor`: он проверяет имя
-базы, runtime без superuser, vector(1024), digest и локальные embeddings.
+Сначала выполни `student_tools.py --config SETTINGS doctor`: он проверяет сокет,
+имя базы, runtime без superuser и не владелец, права, vector(1024), digest и
+локальные embeddings.
 Затем индексируй один синтетический файл, после него разрешённые skills/knowledge.
 Команды: `student_tools.py --config SETTINGS index`, затем
 `student_tools.py --config SETTINGS search "запрос" --profile tech --project __skills__`.
-При необходимости запускай их через настроенный Bitwarden consumer.
+Пароль и Bitwarden для этих команд не нужны: база открывается через сокет.
 
 Подключи MCP server `student-agent-kb` к КАЖДОМУ установленному профилю штатным
 способом его версии Hermes. Hermes подключает MCP только при наличии своего
@@ -243,11 +248,7 @@ Telegram, сохраняются. Не ставь пакет `mcp` в venv Herme
 student-agent-kb` должен показать `Tools discovered: 1` (`agent_kb_search`). Команда: Python этого venv + абсолютный путь
 student_tools.py + `--config SETTINGS mcp`. Инструмент называется
 `agent_kb_search`. Сохрани существующие mcp_servers и tools; не заменяй весь
-config.yaml. Если MCP должен получать DB-пароль, используй разрешённый
-secret launcher с выбранной записью, не пароль внутри command/args/config.
-Для фиксированного MCP из этого пакета есть команда `--config SETTINGS vault-mcp`:
-она сохраняет живой stdio-протокол и не передаёт machine token серверу.
-Обычный vault-run буферизует вывод разовых команд и не подходит как MCP transport.
+config.yaml. Режим `mcp` (без Bitwarden) — основной: базе пароль не нужен.
 Проверь реальный вызов инструмента от агента, а не только наличие записи.
 
 ### Автоматическая привязка и первая загрузка всех полученных материалов
@@ -269,12 +270,9 @@ HOME и не пустая папка. Второй вызов — изменен
 Вспомогательный текст и код внутри скиллов тоже индексируются; картинки,
 аудио, видео и бинарные файлы не превращаются в текст автоматически.
 
-Если DB-пароль берётся из собственного Bitwarden, запуск bootstrap сделай через
-настроенный секретный launcher, передав только AGENTS_KB_PASSWORD. Добавь флаг
-`--via-vault`, если будущий MCP должен запускаться командой vault-mcp. Сам файл
-MCP config содержит только команду и пути, не секреты. Если для этого нет
-разрешённого runtime unlock, сначала реши его локальным входом пользователя;
-не объявляй успешным неработающий поиск из самого агента.
+bootstrap запускай без Bitwarden и без `--via-vault`: база знаний открывается через
+сокет, MCP config содержит только команду и пути, не секреты. Не объявляй успешным
+неработающий поиск из самого агента.
 
 Необязательный `--enable-headless-config` добавляет headed:false и новый
 отдельный профиль браузера только там, где путь ещё не задан. Применяй после

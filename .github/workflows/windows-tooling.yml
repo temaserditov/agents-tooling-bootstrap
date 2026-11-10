@@ -1,5 +1,7 @@
 # One manual Windows x64 acceptance of the tooling package on official Hermes 0.23.0.
 # Owner rule: GitHub runners only for Windows x64 and only when really needed; never ARM.
+# NOT used for v2026.11.10.1 (Windows unsupported). Before reuse: the package now opens its
+# database only through a local socket with peer authentication; this job still uses TCP.
 name: Windows tooling x64
 on:
   workflow_dispatch:

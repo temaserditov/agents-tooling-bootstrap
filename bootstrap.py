@@ -116,8 +116,12 @@ def prepare(hermes_home,settings,via_vault=False,initial_index=False,enable_brow
             # Ours from an older release, another unpack folder or the other launch mode is
             # replaced (with a backup, below); anything else belongs to the student.
             raise BootstrapError('В профиле '+name+' уже есть свой MCP student-agent-kb, не из этого пакета. '
-                                 'Я его не меняю: переименуй его или подтверди замену, затем повтори.')
-        servers['student-agent-kb']=entry
+                                 'Я его не меняю: переименуй его в config.yaml этого профиля и повтори.')
+        if isinstance(current_entry,dict) and ours(current_entry):
+            # Only what the package writes changes; the student's own keys (env, timeout,
+            # enabled: false) stay exactly as they were.
+            servers['student-agent-kb']={**current_entry,'command':entry['command'],'args':entry['args']}
+        else:servers['student-agent-kb']=entry
         own_profile=str(folder/'browser-profile-tooling')
         browser=current.get('browser')
         if isinstance(browser,dict) and browser.get('persistent_profile_path')==own_profile:

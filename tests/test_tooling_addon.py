@@ -251,9 +251,8 @@ class LocalPostgres(unittest.TestCase):
                 (b/'note.md').write_text('alpha separate customer')
                 cfg={'database':{'name':'agents_student_kb','user':'agents_student'},'roots':[{'path':str(a),'project':'a','profile':'tech'},{'path':str(b),'project':'b','profile':'tech'}]}
                 with patch.object(tools,'connection',side_effect=connect),patch.object(tools,'embed',side_effect=lambda cfg,items:[[1.0]+[0.0]*1023 for _ in items]):
-                    with patch.object(tools,'passwordless_login',return_value=True):health=tools.doctor(cfg)
-                    self.assertTrue(health['ready']);self.assertFalse(health['runtimeOwnsDatabase'])
-                    self.assertTrue(any('trust' in w for w in health['warnings']),health['warnings'])
+                    health=tools.doctor(cfg)
+                    self.assertTrue(health['ready']);self.assertFalse(health['runtimeOwnsDatabase']);self.assertTrue(health['socket'])
                     probe=connect(cfg)
                     try:self.assertEqual(probe.run("SELECT has_table_privilege('team_kb_chunks','DELETE')")[0][0],False)
                     finally:probe.close()
@@ -472,6 +471,46 @@ class ReviewFixes(unittest.TestCase):
             self.assertEqual(entry['args'][1],str(ADDON/'student_tools.py'));self.assertEqual(entry['args'][4],'mcp')
             self.assertTrue(first['changed']);self.assertTrue(Path(first['backup']).is_dir())
             self.assertIs(bootstrap.prepare(home,settings)['changed'],False)
+
+    def test_our_entry_keeps_the_students_own_keys_and_disabled_state(self):
+        import yaml
+        bootstrap=load('tooling_bootstrap_keys','bootstrap.py')
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp).resolve()
+            old={'command':'/old/venv/bin/python','args':['-B','/old/student_tools.py','--config','/old/settings.json','mcp'],
+                 'enabled':False,'timeout':120,'env':{'LANG':'C.UTF-8'}}
+            home,folder,settings=self.profile(root,old)
+            bootstrap.prepare(home,settings)
+            entry=yaml.safe_load((folder/'config.yaml').read_text())['mcp_servers']['student-agent-kb']
+            self.assertIs(entry['enabled'],False);self.assertEqual(entry['timeout'],120);self.assertEqual(entry['env'],{'LANG':'C.UTF-8'})
+            self.assertEqual(entry['args'][1],str(ADDON/'student_tools.py'));self.assertEqual(entry['command'],sys.executable)
+            self.assertIs(bootstrap.prepare(home,settings)['changed'],False)
+
+    def test_database_settings_are_socket_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings=Path(tmp).resolve()/'settings.json'
+            base={'schemaVersion':1,'embeddingModel':'bge-m3','embeddingDimensions':1024,'roots':[]}
+            settings.write_text(json.dumps({**base,'database':{'host':'127.0.0.1','name':'agents_student_kb','user':'agents_student'}}))
+            with self.assertRaises(tools.StudentFacingError):tools.config(settings)
+            with self.assertRaises(tools.StudentFacingError):tools.socket_path({'port':5432})
+            self.assertEqual(tools.socket_path({'socket':'/var/run/postgresql','port':5432}),'/var/run/postgresql/.s.PGSQL.5432')
+
+    def test_watch_names_a_damaged_file_once_until_it_changes(self):
+        import io,contextlib
+        with tempfile.TemporaryDirectory() as tmp:
+            src=Path(tmp).resolve()/'notes';src.mkdir();bad=src/'broken.pdf';bad.write_bytes(b'%PDF broken')
+            class FakeDB:
+                def run(self,sql,**kw):return [[True]] if 'pg_try_advisory_lock' in sql else []
+                def close(self):pass
+            cfg={'roots':[{'path':str(src),'project':'p','profile':'tech'}]}
+            tools.REPORTED_SKIPS.clear()
+            def run_once():
+                err=io.StringIO()
+                with patch.object(tools,'connection',return_value=FakeDB()),contextlib.redirect_stderr(err):tools.index(cfg)
+                return err.getvalue().count('source-skipped')
+            self.assertEqual(run_once(),1);self.assertEqual(run_once(),0)
+            bad.write_bytes(b'%PDF broken again, longer');os.utime(bad,None)
+            self.assertEqual(run_once(),1)
 
     def test_a_foreign_student_agent_kb_is_refused_with_a_clear_message(self):
         bootstrap=load('tooling_bootstrap_foreign','bootstrap.py')

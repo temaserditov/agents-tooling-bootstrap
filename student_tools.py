@@ -160,8 +160,9 @@ def config(path):
     d=json.loads(guard(path).read_text(encoding='utf-8'))
     if d.get('schemaVersion')!=1 or d.get('embeddingDimensions')!=1024 or d.get('embeddingModel')!='bge-m3':
         raise ValueError('Review embedding schema before changing model or dimensions')
-    if any(k in d.get('database',{}) for k in ['password','dsn','connectionString']):
-        raise ValueError('Database credentials belong in Bitwarden, not settings.json')
+    if any(k in d.get('database',{}) for k in ['password','dsn','connectionString','host']):
+        raise StudentFacingError('В settings.json для базы знаний не должно быть пароля, строки подключения или host: '
+                                 'агенты подключаются через локальный сокет (database.socket) с peer-аутентификацией.')
     recorded=d.get('embeddingDigest','').removeprefix('sha256:')
     if recorded and recorded!=BGE_M3_DIGEST:
         raise StudentFacingError('В settings.json записан другой digest bge-m3. Индекс не используется: '
@@ -237,19 +238,28 @@ def embed(cfg,texts):
     return vectors
 
 
+def socket_path(db):
+    """The local PostgreSQL Unix socket: agents connect with peer authentication, no password, no TCP."""
+    folder=db.get('socket')
+    if not isinstance(folder,str) or not folder.startswith('/'):
+        raise StudentFacingError('В settings.json укажи database.socket — папку сокета PostgreSQL '
+                                 '(Ubuntu: /var/run/postgresql, Mac Homebrew: /tmp). Подключение по TCP не используется.')
+    return str(Path(folder)/('.s.PGSQL.'+str(int(db.get('port',5432)))))
+
+
 def connection(cfg):
     import pg8000.native
-    db=cfg['database'];host=db.get('host','127.0.0.1')
-    if host not in {'127.0.0.1','localhost','::1'}:raise ValueError('Student KB must be local; remote DB requires separate approval')
+    db=cfg['database']
     if not db.get('name') or not db.get('user'):raise ValueError('Configure a dedicated student database and account')
-    return pg8000.native.Connection(user=db['user'],database=db['name'],host=host,
-                                   port=int(db.get('port',5432)),password=os.getenv('AGENTS_KB_PASSWORD'),timeout=15)
+    return pg8000.native.Connection(user=db['user'],database=db['name'],unix_sock=socket_path(db),timeout=15)
 
 
 def doctor(cfg):
     db=connection(cfg)
     try:
         db.run('BEGIN READ ONLY')
+        if db.run('SELECT inet_server_addr() IS NOT NULL')[0][0]:
+            raise StudentFacingError('Подключение к базе знаний идёт по TCP. Нужен локальный сокет (database.socket).')
         identity=db.run('SELECT current_database(),current_user')[0]
         if list(identity)!=[cfg['database']['name'],cfg['database']['user']]:
             raise ValueError('Connected database identity differs from settings')
@@ -261,6 +271,9 @@ def doctor(cfg):
                 ('team_kb_chunks','SELECT'),('team_kb_chunks','INSERT'),('team_kb_chunks','UPDATE')]
         missing=[t+':'+priv for t,priv in needed if not db.run('SELECT has_table_privilege(current_user,:t,:p)',t=t,p=priv)[0][0]]
         if missing:raise StudentFacingError('Не хватает прав пользователя агентов: '+', '.join(missing)+'. Примени grants.sql.')
+        missing+=[q+':USAGE' for q in ('team_kb_documents_id_seq','team_kb_chunks_id_seq')
+                  if not db.run('SELECT has_sequence_privilege(current_user,:q,\'USAGE\')',q=q)[0][0]]
+        if missing:raise StudentFacingError('Не хватает прав пользователя агентов: '+', '.join(missing)+'. Примени grants.sql.')
         extra=[t+':'+priv for t in ('team_kb_documents','team_kb_chunks') for priv in ('DELETE','TRUNCATE')
                if db.run('SELECT has_table_privilege(current_user,:t,:p)',t=t,p=priv)[0][0]]
         column=db.run("SELECT format_type(atttypid,atttypmod) FROM pg_attribute WHERE attrelid='team_kb_chunks'::regclass AND attname='embedding'")
@@ -270,23 +283,14 @@ def doctor(cfg):
     warnings=[]
     if role[1] or role[2]:warnings.append('Пользователь агентов может создавать роли или базы; эти права ему не нужны.')
     if extra:warnings.append('У пользователя агентов лишние права: '+', '.join(extra)+'; достаточно grants.sql.')
-    if passwordless_login(cfg):
-        warnings.append('База знаний пускает пользователя агентов без пароля (trust в pg_hba.conf для 127.0.0.1). '
-                        'Для своей машины лучше scram-sha-256 и пароль из Bitwarden (FOR-CODEX, раздел 4).')
     vector=embed(cfg,['Synthetic student tooling health check'])[0]
     return {'ready':True,'databaseIdentityVerified':True,'runtimeIsSuperuser':False,'runtimeOwnsDatabase':False,
-            'embeddingDimensions':len(vector),'local':True,'warnings':warnings}
+            'socket':True,'embeddingDimensions':len(vector),'local':True,'warnings':warnings}
 
 
-def passwordless_login(cfg):
-    """True when the runtime role logs in over TCP with no password at all (trust)."""
-    import pg8000.native
-    db=cfg['database']
-    try:
-        pg8000.native.Connection(user=db['user'],database=db['name'],host=db.get('host','127.0.0.1'),
-                                 port=int(db.get('port',5432)),password=None,timeout=10).close()
-        return True
-    except Exception:return False
+# Reported damaged sources: (path) -> (mtime_ns, size). watch reindexes every few minutes;
+# a file is named again only when it changes.
+REPORTED_SKIPS={}
 
 
 def index(cfg):
@@ -309,7 +313,11 @@ def index(cfg):
                     # skipped and named by path only; the rest of the index keeps going.
                     skipped+=1
                     if len(broken)<50:broken.append({'file':str(path),'reason':type(error).__name__})
-                    print(json.dumps({'status':'source-skipped','file':str(path),'reason':type(error).__name__},ensure_ascii=False),file=sys.stderr,flush=True)
+                    try:st=path.stat();mark=(st.st_mtime_ns,st.st_size)
+                    except OSError:mark=None
+                    if REPORTED_SKIPS.get(str(path))!=mark:
+                        REPORTED_SKIPS[str(path)]=mark
+                        print(json.dumps({'status':'source-skipped','file':str(path),'reason':type(error).__name__},ensure_ascii=False),file=sys.stderr,flush=True)
                     continue
                 if not text.strip():skipped+=1;continue
                 content_hash=digest(text.encode())

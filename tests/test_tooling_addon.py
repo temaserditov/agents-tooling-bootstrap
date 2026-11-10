@@ -468,6 +468,12 @@ class PublicBundle(unittest.TestCase):
         self.assertEqual(labels,{'host path','e-mail','learner id','host volume','bot token'})
         self.assertEqual(b.private_findings({'b.md':b'/home/x/fixture %LOCALAPPDATA%\\hermes C:\\Users\\USER\\x'}),[])
 
+    def test_windows_workflow_powershell_parses_as_the_runner_reads_it(self):
+        checker=ADDON/'release/check-workflow-powershell.py'
+        if not checker.is_file() or not shutil.which('pwsh'):self.skipTest('needs the repository checkout and pwsh')
+        r=subprocess.run([sys.executable,str(checker)],capture_output=True,text=True)
+        self.assertEqual(r.returncode,0,r.stdout+r.stderr)
+
     def test_every_shipped_file_is_clean(self):
         b=self.builder()
         files={n:(ADDON/n).read_bytes() for n in subprocess.check_output(['git','ls-files','-z'],cwd=ADDON).decode().split('\0') if n and not b.EXCLUDE.match(n)}

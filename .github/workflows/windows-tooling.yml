@@ -21,6 +21,7 @@ jobs:
       PGVECTOR_SHA: f37c13f68b57d2c3472b2214fbcff699d6d34876
       AGENTS_TOOLING_QA_MAX_FILES: '3'
       PYTHONUTF8: '1'
+      PYTHONIOENCODING: utf-8
     steps:
       - uses: actions/checkout@v4
       - name: Official Hermes 0.23.0 with the reviewed installer (newline-normalized pin)
@@ -42,10 +43,13 @@ jobs:
           if(-not (Test-Path -LiteralPath $hermes)){$hermes=(Get-Command hermes -ErrorAction Stop).Source}
           $version=(& $hermes --version 2>&1|Out-String);$version
           if($version -notmatch 'v0\.23\.0'){throw 'Hermes is not 0.23.0'}
+      # Cyrillic text: PowerShell 7 reads the step as UTF-8; Windows PowerShell 5.1 would
+      # read the BOM-less script in cp1252 and break its strings.
       - name: Course-like profiles (synthetic; Windows v3 itself is not installed here)
-        shell: powershell
+        shell: pwsh
         run: |
           $ErrorActionPreference='Stop'
+          [Console]::OutputEncoding=[Text.Encoding]::UTF8;$OutputEncoding=[Text.Encoding]::UTF8
           $root=Join-Path $env:LOCALAPPDATA 'hermes\profiles'
           foreach($p in 'tech','copywriter'){
             $dir=Join-Path $root $p
@@ -75,28 +79,48 @@ jobs:
           if(@($d.profiles).Count -ne 2){throw 'inventory did not find the profiles'}
           if($inv -match 'CANARY-WINDOWS-SECRET'){throw 'inventory leaked a secret'}
       - name: PostgreSQL 17 cluster with pgvector built from a pinned commit
-        shell: cmd
+        shell: pwsh
         run: |
-          set "PGROOT=C:\Program Files\PostgreSQL\17"
-          git clone -q https://github.com/pgvector/pgvector.git "%RUNNER_TEMP%\pgvector" || exit /b 1
-          git -C "%RUNNER_TEMP%\pgvector" checkout -q %PGVECTOR_SHA% || exit /b 1
-          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath`) do set "VS=%%i"
-          call "%VS%\VC\Auxiliary\Build\vcvars64.bat" >nul || exit /b 1
-          cd /d "%RUNNER_TEMP%\pgvector" && nmake /nologo /F Makefile.win >nul && nmake /nologo /F Makefile.win install >nul || exit /b 1
-          "%PGROOT%\bin\initdb.exe" -D "%RUNNER_TEMP%\pg" -A trust -U postgres --encoding=UTF8 --no-instructions >nul || exit /b 1
-          "%PGROOT%\bin\pg_ctl.exe" -D "%RUNNER_TEMP%\pg" -l "%RUNNER_TEMP%\pg.log" -o "-h 127.0.0.1 -p 5433" -w start || exit /b 1
-          "%PGROOT%\bin\psql.exe" -h 127.0.0.1 -p 5433 -U postgres -v ON_ERROR_STOP=1 -q -c "CREATE ROLE agents_student LOGIN" -c "CREATE DATABASE agents_student_kb" || exit /b 1
-          "%PGROOT%\bin\psql.exe" -h 127.0.0.1 -p 5433 -U postgres -d agents_student_kb -v ON_ERROR_STOP=1 -q -f schema.sql || exit /b 1
-          "%PGROOT%\bin\psql.exe" -h 127.0.0.1 -p 5433 -U postgres -d agents_student_kb -v ON_ERROR_STOP=1 -q -c "GRANT USAGE ON SCHEMA public TO agents_student; GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA public TO agents_student; GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA public TO agents_student;" || exit /b 1
+          $ErrorActionPreference='Stop'
+          $pg=if($env:PGROOT -and (Test-Path -LiteralPath "$env:PGROOT\bin\initdb.exe")){$env:PGROOT}else{'C:\Program Files\PostgreSQL\17'}
+          if(-not (Test-Path -LiteralPath "$pg\bin\initdb.exe")){throw "PostgreSQL not found at $pg"}
+          $src="$env:RUNNER_TEMP\pgvector"
+          git clone -q https://github.com/pgvector/pgvector.git $src; if($LASTEXITCODE){throw 'pgvector clone failed'}
+          git -C $src checkout -q $env:PGVECTOR_SHA; if($LASTEXITCODE){throw 'pgvector pin missing'}
+          $vs=& "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          if(-not $vs){throw 'Visual Studio build tools not found'}
+          $build="$env:RUNNER_TEMP\build-pgvector.cmd"
+          @(
+            '@echo off'
+            ('call "{0}\VC\Auxiliary\Build\vcvars64.bat" >nul || exit /b 1' -f $vs)
+            ('set "PGROOT={0}"' -f $pg)
+            ('cd /d "{0}" || exit /b 1' -f $src)
+            'nmake /nologo /F Makefile.win || exit /b 1'
+            'nmake /nologo /F Makefile.win install || exit /b 1'
+          ) | Set-Content -LiteralPath $build -Encoding ascii
+          & cmd.exe /d /c $build; if($LASTEXITCODE){throw 'pgvector build failed'}
+          & "$pg\bin\initdb.exe" -D "$env:RUNNER_TEMP\pg" -A trust -U postgres --encoding=UTF8 --no-instructions; if($LASTEXITCODE){throw 'initdb failed'}
+          & "$pg\bin\pg_ctl.exe" -D "$env:RUNNER_TEMP\pg" -l "$env:RUNNER_TEMP\pg.log" -o '-h 127.0.0.1 -p 5433' -w start; if($LASTEXITCODE){Get-Content "$env:RUNNER_TEMP\pg.log" -Tail 20;throw 'postgres start failed'}
+          $psql="$pg\bin\psql.exe"
+          & $psql -h 127.0.0.1 -p 5433 -U postgres -v ON_ERROR_STOP=1 -q -c 'CREATE ROLE agents_student LOGIN'; if($LASTEXITCODE){throw 'role'}
+          & $psql -h 127.0.0.1 -p 5433 -U postgres -v ON_ERROR_STOP=1 -q -c 'CREATE DATABASE agents_student_kb'; if($LASTEXITCODE){throw 'database'}
+          & $psql -h 127.0.0.1 -p 5433 -U postgres -d agents_student_kb -v ON_ERROR_STOP=1 -q -f schema.sql; if($LASTEXITCODE){throw 'schema'}
+          & $psql -h 127.0.0.1 -p 5433 -U postgres -d agents_student_kb -v ON_ERROR_STOP=1 -q -c 'GRANT USAGE ON SCHEMA public TO agents_student; GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA public TO agents_student; GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA public TO agents_student;'; if($LASTEXITCODE){throw 'grants'}
+          & $psql -h 127.0.0.1 -p 5433 -U postgres -d agents_student_kb -tAc "SELECT extversion FROM pg_extension WHERE extname='vector'"
       - name: Ollama (pinned release) and the pinned bge-m3
         shell: powershell
         run: |
           $ErrorActionPreference='Stop'
+          # Windows PowerShell 5.1 downloads many times slower while drawing a progress bar.
+          $ProgressPreference='SilentlyContinue'
           $zip="$env:RUNNER_TEMP\ollama.zip"
           $url="https://github.com/ollama/ollama/releases/download/$env:OLLAMA_TAG/ollama-windows-amd64.zip"
           for($i=1;$i -le 4;$i++){try{Invoke-WebRequest -UseBasicParsing $url -OutFile $zip -TimeoutSec 600;break}catch{if($i -eq 4){throw};Start-Sleep -Seconds (15*$i)}}
           if((Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:OLLAMA_ZIP_SHA256){throw 'Ollama archive SHA256 mismatch'}
-          Expand-Archive -LiteralPath $zip -DestinationPath "$env:RUNNER_TEMP\ollama" -Force; Remove-Item $zip
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\ollama" | Out-Null
+          & tar.exe -xf $zip -C "$env:RUNNER_TEMP\ollama"; if($LASTEXITCODE){throw 'Ollama archive did not unpack'}
+          Remove-Item $zip
+          if(-not (Test-Path -LiteralPath "$env:RUNNER_TEMP\ollama\ollama.exe")){throw 'ollama.exe missing in the archive'}
           $env:OLLAMA_HOST='127.0.0.1:11434'
           Start-Process -FilePath "$env:RUNNER_TEMP\ollama\ollama.exe" -ArgumentList 'serve' -WindowStyle Hidden -RedirectStandardOutput "$env:RUNNER_TEMP\ollama.out" -RedirectStandardError "$env:RUNNER_TEMP\ollama.err"
           $deadline=(Get-Date).AddSeconds(90);do{try{Invoke-WebRequest -UseBasicParsing http://127.0.0.1:11434/api/tags -TimeoutSec 3|Out-Null;$up=$true}catch{Start-Sleep 2}}until($up -or (Get-Date) -gt $deadline)
@@ -114,10 +138,13 @@ jobs:
           [IO.File]::WriteAllText("$t\settings.json",($c|ConvertTo-Json -Depth 8))
           & $py -B student_tools.py --config "$t\settings.json" model-check; if($LASTEXITCODE){exit 1}
           & $py -B student_tools.py --config "$t\settings.json" doctor; if($LASTEXITCODE){exit 1}
+      # Cyrillic text: PowerShell 7 reads the step as UTF-8; Windows PowerShell 5.1 would
+      # read the BOM-less script in cp1252 and break its strings.
       - name: Bootstrap with first index, search, then a repeat that changes nothing
-        shell: powershell
+        shell: pwsh
         run: |
           $ErrorActionPreference='Stop'
+          [Console]::OutputEncoding=[Text.Encoding]::UTF8;$OutputEncoding=[Text.Encoding]::UTF8
           $py="$env:RUNNER_TEMP\tv\Scripts\python.exe";$t="$env:RUNNER_TEMP\tooling";$h=Join-Path $env:LOCALAPPDATA 'hermes'
           $first=& $py -B bootstrap.py --hermes-home $h --settings "$t\settings.json" --index | Out-String;"BOOTSTRAP1 $first"
           $r=$first|ConvertFrom-Json; if($r.status -eq 'failed' -or $r.index.documentsWritten -lt 1 -or -not $r.changed){throw 'first bootstrap failed'}
@@ -128,18 +155,32 @@ jobs:
           foreach($p in 'tech','copywriter'){foreach($f in 'AGENTS.md','SOUL.md'){$x=Get-Content -Raw (Join-Path $h "profiles\$p\$f");$n=([regex]::Matches($x,'agents-student-tooling:start')).Count;if($n -ne 1){throw "block $p/$f=$n"};if($f -eq 'AGENTS.md' -and $x -notmatch 'Личное правило ученика'){throw 'personal text lost'}}}
           Get-ChildItem -Recurse -File $t | ForEach-Object { if((Get-Content -Raw $_.FullName) -match 'CANARY-WINDOWS-SECRET'){throw "secret copied into $($_.FullName)"} }
           'TOOLING_IDEMPOTENT changed=false, blocks intact, no secrets copied'
+      # Cyrillic text: PowerShell 7 reads the step as UTF-8; Windows PowerShell 5.1 would
+      # read the BOM-less script in cp1252 and break its strings.
       - name: Pinned Whisper model and offline transcription of a short Russian phrase
-        shell: powershell
+        shell: pwsh
         run: |
           $ErrorActionPreference='Stop'
+          [Console]::OutputEncoding=[Text.Encoding]::UTF8;$OutputEncoding=[Text.Encoding]::UTF8
           $py="$env:RUNNER_TEMP\tv\Scripts\python.exe";$m="$env:RUNNER_TEMP\models\small"
           & $py -B student_tools.py fetch-whisper-model --model-dir $m; if($LASTEXITCODE){exit 1}
           $again=& $py -B student_tools.py fetch-whisper-model --model-dir $m | Out-String; if(($again|ConvertFrom-Json).changed -ne $false){throw 'model fetch not idempotent'}
-          # Offline for real: block outbound traffic of this interpreter while it transcribes.
-          $exe=(& $py -c "import sys;print(sys.executable)").Trim()
-          New-NetFirewallRule -DisplayName 'tooling-offline-asr' -Direction Outbound -Action Block -Program $exe | Out-Null
-          try{$out=& $py -B student_tools.py transcribe --model-dir $m --audio tests\fixtures\ru-phrase.wav --output "$env:RUNNER_TEMP\asr.json" | Out-String}
-          finally{Remove-NetFirewallRule -DisplayName 'tooling-offline-asr'}
+          # Offline for real. A Windows venv python.exe is a redirector: the base interpreter
+          # it starts opens the sockets, so block both, and give the process a dead proxy too.
+          $exes=@(& $py -c "import sys;print(sys.executable);print(sys._base_executable)")|ForEach-Object{$_.Trim()}|Where-Object{$_}|Sort-Object -Unique
+          $i=0;foreach($e in $exes){$i++;New-NetFirewallRule -DisplayName "tooling-offline-asr-$i" -Direction Outbound -Action Block -Program $e | Out-Null}
+          $saved=@{};foreach($k in 'HTTPS_PROXY','HTTP_PROXY','ALL_PROXY','NO_PROXY'){$saved[$k]=[Environment]::GetEnvironmentVariable($k)}
+          $env:HTTPS_PROXY='http://127.0.0.1:9';$env:HTTP_PROXY='http://127.0.0.1:9';$env:ALL_PROXY='http://127.0.0.1:9';$env:NO_PROXY=''
+          try{
+            & $py -c "import urllib.request,sys;urllib.request.urlopen('https://huggingface.co',timeout=10);sys.exit(0)" 2>$null
+            if($LASTEXITCODE -eq 0){throw 'OFFLINE_NOT_ENFORCED: the interpreter still reaches the network'}
+            'OFFLINE_ENFORCED'
+            $out=& $py -B student_tools.py transcribe --model-dir $m --audio tests\fixtures\ru-phrase.wav --output "$env:RUNNER_TEMP\asr.json" | Out-String
+            if($LASTEXITCODE){throw "offline transcription failed: $out"}
+          }finally{
+            1..$i|ForEach-Object{Remove-NetFirewallRule -DisplayName "tooling-offline-asr-$_" -ErrorAction SilentlyContinue}
+            foreach($k in $saved.Keys){[Environment]::SetEnvironmentVariable($k,$saved[$k])}
+          }
           $asr=Get-Content -Raw -Encoding UTF8 "$env:RUNNER_TEMP\asr.json"|ConvertFrom-Json
           $text=($asr.segments|%{$_.text}) -join ' ';"ASR language=$($asr.language) text=$text"
           if($asr.language -ne 'ru' -or $text -notmatch '(?i)распознав' -or $text -notmatch '(?i)интернет'){throw 'unexpected transcript'}

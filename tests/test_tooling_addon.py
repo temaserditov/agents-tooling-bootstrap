@@ -233,24 +233,30 @@ class LocalPostgres(unittest.TestCase):
             import shlex
             options=f'-k {shlex.quote(str(sock))} -h \'\' -p {port}'
             subprocess.run([str(bindir/'pg_ctl'),'-D',str(data),'-l',str(root/'server.log'),'-o',options,'-w','start'],check=True,capture_output=True)
-            def connect(cfg):return pg8000.native.Connection(user=cfg.get('database',{}).get('user',getpass.getuser()),database='postgres',unix_sock=str(sock/f'.s.PGSQL.{port}'))
+            def connect(cfg):
+                d=cfg.get('database',{})
+                return pg8000.native.Connection(user=d.get('user',getpass.getuser()),database=d.get('name','postgres'),unix_sock=str(sock/f'.s.PGSQL.{port}'))
+            psql=lambda db,sql:subprocess.run([str(bindir/'psql'),'-X','-q','-h',str(sock),'-p',str(port),'-d',db,'-v','ON_ERROR_STOP=1','-f',str(ADDON/sql)],capture_output=True,text=True)
             try:
                 db=connect({})
                 try:
-                    # Known static schema only; no production database is contacted.
-                    for statement in (ADDON/'schema.sql').read_text().split(';'):
-                        if statement.strip():db.run(statement)
-                    db.run('CREATE ROLE agents_fixture LOGIN')
-                    db.run('GRANT USAGE ON SCHEMA public TO agents_fixture')
-                    db.run('GRANT SELECT,INSERT,UPDATE ON ALL TABLES IN SCHEMA public TO agents_fixture')
-                    db.run('GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA public TO agents_fixture')
+                    db.run('CREATE ROLE agents_student LOGIN');db.run('CREATE DATABASE agents_student_kb')
                 finally:db.close()
+                # The schema refuses any other database; the exact grants need the dedicated one.
+                self.assertNotEqual(psql('postgres','schema.sql').returncode,0)
+                for sql in ('schema.sql','grants.sql'):
+                    r=psql('agents_student_kb',sql);self.assertEqual(r.returncode,0,r.stderr)
                 a=root/'project-a';b=root/'project-b';a.mkdir();b.mkdir()
                 (a/'note.md').write_text('alpha lighthouse original')
                 (b/'note.md').write_text('alpha separate customer')
-                cfg={'database':{'name':'postgres','user':'agents_fixture'},'roots':[{'path':str(a),'project':'a','profile':'tech'},{'path':str(b),'project':'b','profile':'tech'}]}
+                cfg={'database':{'name':'agents_student_kb','user':'agents_student'},'roots':[{'path':str(a),'project':'a','profile':'tech'},{'path':str(b),'project':'b','profile':'tech'}]}
                 with patch.object(tools,'connection',side_effect=connect),patch.object(tools,'embed',side_effect=lambda cfg,items:[[1.0]+[0.0]*1023 for _ in items]):
-                    self.assertTrue(tools.doctor(cfg)['ready'])
+                    with patch.object(tools,'passwordless_login',return_value=True):health=tools.doctor(cfg)
+                    self.assertTrue(health['ready']);self.assertFalse(health['runtimeOwnsDatabase'])
+                    self.assertTrue(any('trust' in w for w in health['warnings']),health['warnings'])
+                    probe=connect(cfg)
+                    try:self.assertEqual(probe.run("SELECT has_table_privilege('team_kb_chunks','DELETE')")[0][0],False)
+                    finally:probe.close()
                     self.assertEqual(tools.index(cfg)['documentsWritten'],2)
                     self.assertEqual(tools.index(cfg)['unchanged'],2)
                     result=tools.search(cfg,'alpha','tech','a')['results']
@@ -439,6 +445,76 @@ class Idempotency(unittest.TestCase):
             self.assertEqual(text.count(bootstrap.BEGIN),1);self.assertIn('New course rule.',text);self.assertIn('My own rule.',text)
             self.assertIs(bootstrap.prepare(home,settings)['changed'],False)
             self.assertTrue(third['changed'])  # only the index snapshot of the instructions moved
+
+
+class ReviewFixes(unittest.TestCase):
+    """Upgrade from an older release, damaged sources, an empty model folder."""
+    def profile(self,root,entry=None):
+        import yaml
+        home=root/'hermes';folder=home/'profiles/tech';(folder/'skills/s').mkdir(parents=True)
+        (folder/'skills/s/SKILL.md').write_text('# s');(folder/'AGENTS.md').write_text('# t\n');(folder/'SOUL.md').write_text('# soul\n')
+        cfg={'model':{'provider':'x'},'mcp_servers':{}}
+        if entry is not None:cfg['mcp_servers']['student-agent-kb']=entry
+        (folder/'config.yaml').write_text(yaml.safe_dump(cfg))
+        settings=root/'new-tooling/settings.json';settings.parent.mkdir()
+        settings.write_text((ADDON/'settings.example.json').read_text())
+        return home,folder,settings
+
+    def test_upgrade_from_an_older_release_or_another_folder_replaces_our_entry(self):
+        import yaml
+        bootstrap=load('tooling_bootstrap_upgrade','bootstrap.py')
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp).resolve()
+            old={'command':str(root/'old-tooling/venv/bin/python'),'args':['-B',str(root/'old-tooling/student_tools.py'),'--config',str(root/'old-tooling/settings.json'),'vault-mcp']}
+            home,folder,settings=self.profile(root,old)
+            first=bootstrap.prepare(home,settings)
+            entry=yaml.safe_load((folder/'config.yaml').read_text())['mcp_servers']['student-agent-kb']
+            self.assertEqual(entry['args'][1],str(ADDON/'student_tools.py'));self.assertEqual(entry['args'][4],'mcp')
+            self.assertTrue(first['changed']);self.assertTrue(Path(first['backup']).is_dir())
+            self.assertIs(bootstrap.prepare(home,settings)['changed'],False)
+
+    def test_a_foreign_student_agent_kb_is_refused_with_a_clear_message(self):
+        bootstrap=load('tooling_bootstrap_foreign','bootstrap.py')
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp).resolve();home,folder,settings=self.profile(root,{'command':'node','args':['my-server.js']})
+            before=(folder/'config.yaml').read_text()
+            with self.assertRaises(bootstrap.BootstrapError) as caught:bootstrap.prepare(home,settings)
+            self.assertIn('не из этого пакета',str(caught.exception));self.assertEqual((folder/'config.yaml').read_text(),before)
+            r=subprocess.run([sys.executable,'-B',str(ADDON/'bootstrap.py'),'--hermes-home',str(home),'--settings',str(settings)],capture_output=True,text=True)
+            self.assertEqual(r.returncode,1);self.assertIn('не из этого пакета',r.stdout)
+
+    def test_damaged_sources_are_skipped_and_office_lock_files_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp).resolve();src=root/'notes';src.mkdir()
+            (src/'good.md').write_text('alpha lighthouse')
+            (src/'broken.pdf').write_bytes(b'%PDF-1.4 this is not a pdf')
+            (src/'broken.docx').write_bytes(b'PK\x03\x04 not really a zip')
+            (src/'~$draft.docx').write_bytes(b'owner lock')
+            self.assertNotIn('~$draft.docx',[p.name for p in tools.candidates(src)])
+            class FakeDB:
+                def run(self,sql,**kw):
+                    if 'pg_try_advisory_lock' in sql:return [[True]]
+                    if 'RETURNING id' in sql:return [[1]]
+                    return []
+                def close(self):pass
+            cfg={'roots':[{'path':str(src),'project':'p','profile':'tech'}]}
+            with patch.object(tools,'connection',return_value=FakeDB()),patch.object(tools,'embed',side_effect=lambda c,items:[[0.0]*1024 for _ in items]):
+                result=tools.index(cfg)
+            self.assertEqual(result['documentsWritten'],1);self.assertEqual(result['skipped'],2)
+            self.assertEqual(sorted(Path(x['file']).name for x in result['skippedFiles']),['broken.docx','broken.pdf'])
+            self.assertNotIn('not a pdf',json.dumps(result))
+
+    def test_an_empty_model_folder_made_in_advance_is_fine(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            files={'model.bin':b'w'};pins={'model.bin':__import__('hashlib').sha256(b'w').hexdigest()}
+            target=Path(tmp).resolve()/'model';target.mkdir()
+            def download(t):Path(t).mkdir(parents=True,exist_ok=True);(Path(t)/'model.bin').write_bytes(b'w')
+            with patch.dict(tools.WHISPER_FILES,pins,clear=True):
+                self.assertTrue(tools.fetch_whisper_model(target,download=download,sleep=lambda s:None)['changed'])
+
+    def test_browser_smoke_has_no_python_310_only_arguments(self):
+        text=(ADDON/'browser-smoke.py').read_text()
+        self.assertNotIn('ignore_cleanup_errors=True)',text);self.assertIn("sys.version_info>=(3,10)",text)
 
 
 class LockedLibraries(unittest.TestCase):

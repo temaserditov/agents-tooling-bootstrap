@@ -23,6 +23,20 @@ END='<!-- agents-student-tooling:end -->'
 BRAIN_FILES=('AGENTS.md','SOUL.md','IDENTITY.md','OUTPUT_STANDARDS.md','FIRST_RUN.md','COMMANDS.md')
 
 
+class BootstrapError(ValueError):
+    """A refusal with a fixed text that is safe and meant to be shown as is."""
+
+
+def ours(entry):
+    """True for a student-agent-kb entry written by any version of this package."""
+    if not isinstance(entry,dict) or set(entry)-{'command','args','env','timeout','enabled'}:return False
+    args=entry.get('args')
+    return (isinstance(entry.get('command'),str) and isinstance(args,list) and len(args)==5
+            and args[0]=='-B' and isinstance(args[1],str) and Path(args[1]).name=='student_tools.py'
+            and args[2]=='--config' and isinstance(args[3],str) and Path(args[3]).name.endswith('.json')
+            and args[4] in ('mcp','vault-mcp'))
+
+
 def safe(path):
     path=Path(path).absolute()
     for part in [path,*path.parents]:
@@ -43,7 +57,8 @@ def readable(path):
 def block(text,addition):
     if BEGIN in text or END in text:
         if text.count(BEGIN)!=1 or text.count(END)!=1 or text.index(BEGIN)>text.index(END):
-            raise ValueError('Edited tooling markers; merge explicitly')
+            raise BootstrapError('Метки блока agents-student-tooling в инструкциях изменены вручную; '
+                                 'исправь их (одна пара start/end) и повтори.')
         start=text.index(BEGIN);end=text.index(END)+len(END)
         return text[:start]+addition+text[end:]
     return text.rstrip()+'\n\n'+addition+'\n'
@@ -59,7 +74,7 @@ def prepare(hermes_home,settings,via_vault=False,initial_index=False,enable_brow
     import yaml
     root=safe(hermes_home);settings=safe(settings)
     state=inventory.scan(hermes_home=root)
-    if not state['profiles']:raise ValueError('No existing course profiles found; do not install new agents')
+    if not state['profiles']:raise BootstrapError('Не найдены установленные профили агентов курса. Дооснащение ставится только поверх установленных агентов.')
     cfg=json.loads(settings.read_text())
     if cfg.get('schemaVersion')!=1 or cfg.get('embeddingModel')!='bge-m3' or cfg.get('embeddingDimensions')!=1024:
         raise ValueError('Review settings and vector schema first')
@@ -96,8 +111,12 @@ def prepare(hermes_home,settings,via_vault=False,initial_index=False,enable_brow
         if not isinstance(current,dict):raise ValueError('Unexpected profile config; preserve it')
         servers=current.setdefault('mcp_servers',{})
         if not isinstance(servers,dict):raise ValueError('MCP format needs version-specific review')
-        if 'student-agent-kb' in servers and servers['student-agent-kb']!=entry:
-            raise ValueError('Existing student-agent-kb configuration differs; preserve it')
+        current_entry=servers.get('student-agent-kb')
+        if current_entry is not None and current_entry!=entry and not ours(current_entry):
+            # Ours from an older release, another unpack folder or the other launch mode is
+            # replaced (with a backup, below); anything else belongs to the student.
+            raise BootstrapError('В профиле '+name+' уже есть свой MCP student-agent-kb, не из этого пакета. '
+                                 'Я его не меняю: переименуй его или подтверди замену, затем повтори.')
         servers['student-agent-kb']=entry
         own_profile=str(folder/'browser-profile-tooling')
         browser=current.get('browser')
@@ -180,6 +199,13 @@ if __name__=='__main__':
     try:
         result=inventory.scan(hermes_home=a.hermes_home) if a.inspect else prepare(a.hermes_home,a.settings,a.via_vault,a.index,a.enable_headless_config)
         print(json.dumps(result,ensure_ascii=False,indent=2))
+    except BootstrapError as error:
+        print(json.dumps({'status':'failed','errorClass':'BootstrapError','message':str(error)},ensure_ascii=False))
+        sys.exit(1)
     except Exception as error:
+        # The student tools' own fixed texts (pins, retries, database rights) are safe to show.
+        if type(error).__name__=='StudentFacingError':
+            print(json.dumps({'status':'failed','errorClass':'StudentFacingError','message':str(error)},ensure_ascii=False))
+            sys.exit(1)
         print(json.dumps({'status':'failed','errorClass':type(error).__name__,'message':'Review local preflight and saved backup; raw config and credentials suppressed.'}))
         sys.exit(1)

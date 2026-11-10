@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.parse
@@ -56,9 +57,13 @@ def cdp_page_title_ok(port_file,proc,deadline=60):
     return False
 
 
+# Python 3.9 (macOS system Python) has no ignore_cleanup_errors.
+CLEANUP={'ignore_cleanup_errors':True} if sys.version_info>=(3,10) else {}
+
+
 def hermes_smoke(python,hermes_home):
     if not Path(python).is_file():raise ValueError('Hermes Python missing')
-    with tempfile.TemporaryDirectory(prefix='hb-',dir='/tmp' if os.name!='nt' else None,ignore_cleanup_errors=True) as tmp:
+    with tempfile.TemporaryDirectory(prefix='hb-',dir='/tmp' if os.name!='nt' else None,**CLEANUP) as tmp:
         root=Path(tmp).resolve();profile=root/'profile'
         env={**isolated_env(root),'HERMES_HOME':str(Path(hermes_home).resolve())}
         if 'HOME' in os.environ:env['HOME']=os.environ['HOME']  # pm's Chromium store lives under the real home

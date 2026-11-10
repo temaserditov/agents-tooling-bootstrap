@@ -16,8 +16,9 @@ Telegram Reader исключён: не устанавливай/не переа�
 Дооснащение ставится ПОВЕРХ уже обновлённой установки, а не вместо обновления:
 
 1. Агенты установлены и обновлены штатно: сначала патч агентов
-   **v2026.11.10.2** (https://github.com/temaserditov/agents-repair-patch/releases/tag/v2026.11.10.2,
-   его задание: ремонт → штатное обновление → ремонт → verify), затем это дооснащение.
+   **v2026.11.10.3 или новее** (https://github.com/temaserditov/agents-repair-patch/releases/tag/v2026.11.10.3;
+   более новый выпуск патча тоже подходит — не требуй именно .3; его задание:
+   ремонт → штатное обновление → ремонт → verify), затем это дооснащение.
 2. `hermes --version` показывает **0.23.0** (commit `2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19`).
    Hermes 0.21–0.22 код пакета понимает, но этот выпуск проверялся на 0.23.0.
 3. Последний `repair.sh verify` / `repair.ps1 verify` патча завершился без красных пунктов.
@@ -55,10 +56,7 @@ Telegram Reader исключён: не устанавливай/не переа�
 
 Запусти `python inventory.py`. На Mac/Ubuntu предпочтителен Python установленного
 Hermes, не случайный системный. inventory ничего не устанавливает и не читает
-авторизацию. На Windows официальный Hermes (Windows v3) живёт в
-`%LOCALAPPDATA%\hermes` (профили — `%LOCALAPPDATA%\hermes\profiles`, Python —
-`%LOCALAPPDATA%\hermes\hermes-agent\venv\Scripts\python.exe`); inventory находит его
-сам, а при другом расположении передай `--hermes-home ABSOLUTE_PATH`.
+авторизацию. При нестандартном расположении Hermes передай `--hermes-home ABSOLUTE_PATH`.
 Не принимай отсутствие пакета в одном Python за его отсутствие во всей системе.
 
 Определи сценарий: Mac локально, Ubuntu VPS либо Windows→VPS (Windows локально в этом
@@ -86,16 +84,26 @@ cookie, токены и пароли в чат, команды или отчёт
 
 На Mac используй существующий Homebrew. На Ubuntu — подходящие официальные
 пакеты дистрибутива, например ffmpeg, yt-dlp, ripgrep, poppler-utils,
-tesseract-ocr, tesseract-ocr-rus, tesseract-ocr-eng. На Windows x64 — только
-официальные источники (winget-пакеты издателей или страницы релизов проектов):
-не подбирай исполняемый файл по случайной ссылке.
+tesseract-ocr, tesseract-ocr-rus, tesseract-ocr-eng. Не подбирай исполняемый файл
+по случайной ссылке.
 Не ставь всё из списка повторно и не устанавливай LibreOffice, CUDA, Docker,
 Visual Studio или TTS-модели без установленной необходимости.
 
 Для этого пакета создай ОТДЕЛЬНЫЙ venv Python 3.11–3.13 и поставь requirements.lock
-с проверкой хешей. requirements.txt описывает прямые зависимости.
-Это не venv Hermes и не venv Content. Проверь wheels до установки, не запускай
-многочасовую сборку неизвестного пакета на неподдерживаемой архитектуре.
+с проверкой хешей (`pip install --require-hashes -r requirements.lock`).
+requirements.txt описывает прямые зависимости. Это не venv Hermes и не venv Content.
+Проверь wheels до установки, не запускай многочасовую сборку неизвестного пакета
+на неподдерживаемой архитектуре.
+
+**Обновление с прошлого выпуска (например, v2026.11.04.1).** Распакуй новый пакет
+рядом, в новую папку, и создай НОВЫЙ venv по новым lock-файлам — старый venv не
+переиспользуй: в прошлых lock были `mcp` 1.26 (известные уязвимости) и `pg8000`
+1.31.5 (не подключался к PostgreSQL по SSL), а распознавание речи не работало с
+закреплённым `av`. Затем выполни bootstrap из новой папки: он узнаёт прежнюю
+запись `student-agent-kb` этого пакета (другая папка, другой Python, режим vault)
+и заменяет её с резервной копией; чужую запись с тем же именем не трогает и
+говорит об этом. settings.json перенеси из старой папки (там ID секретов и roots).
+Старую папку и venv удаляй только после проверки поиска у агентов.
 
 ## 3. Bitwarden — собственное хранилище
 
@@ -122,7 +130,7 @@ PYTHON student_tools.py --config SETTINGS vault-run -- PYTHON consumer.py
 
 Bootstrap авторизации тоже нужен: существующий безопасный секретный launcher
 или скрытый локальный ввод токена в интерактивном терминале. Не сохраняй токен
-открытым в .env, AGENTS.md, plist, Scheduled Task или settings.json. Не подключай
+открытым в .env, AGENTS.md, plist, systemd-юните или settings.json. Не подключай
 Keychain/другое хранилище вместо Bitwarden молча. После перезагрузки может
 потребоваться повторный unlock: не называй систему полностью автономной, если
 нет отдельно согласованного безопасного запуска служб с доступом к Bitwarden.
@@ -142,9 +150,35 @@ Keychain/другое хранилище вместо Bitwarden молча. По
 Предпочти существующие PostgreSQL/Ollama, если они совместимы. Создай отдельную
 базу `agents_student_kb` и отдельного runtime-пользователя с минимальными правами.
 Не трогай существующие базы и не включай trust для общесистемного TCP.
-Пароль сгенерируй в памяти, сохрани в моём Bitwarden; не печатай. Применять
-schema.sql можно ТОЛЬКО в этой новой базе, после проверки имени и владельца.
-Расширение создаёт администратор локальной БД; агентам не нужен superuser.
+
+Порядок (выполняет администратор локальной БД: на Mac — твой пользователь
+Homebrew-PostgreSQL, на Ubuntu — `sudo -u postgres`):
+
+1. `CREATE ROLE agents_student LOGIN;` и `CREATE DATABASE agents_student_kb;` —
+   владелец базы администратор, НЕ agents_student; agents_student не superuser,
+   не создаёт роли и базы.
+2. `psql -d agents_student_kb -v ON_ERROR_STOP=1 -f schema.sql` — схема сама откажется
+   выполняться в другой базе. Затем `-f grants.sql`: ровно нужные права (SELECT,
+   INSERT, UPDATE на две таблицы и их последовательности, CONNECT, USAGE), с проверкой
+   владельца и ролей.
+3. Пароль runtime-пользователя. Попроси меня создать в веб-интерфейсе Bitwarden
+   Secrets Manager секрет AGENTS_KB_PASSWORD (сгенерированный пароль от 16 символов)
+   в моём проекте и назвать тебе только его ID (UUID) — значение ты не видишь и не
+   спрашиваешь. Запиши ID в settings.json → `secretMap`. Затем поставь пароль роли
+   без вывода и без аргументов командной строки:
+   ```text
+   PYTHON student_tools.py --config SETTINGS vault-run -- psql -X -q -v ON_ERROR_STOP=1 -h 127.0.0.1 -U ADMIN -d postgres -f set-role-password.sql
+   ```
+   На Ubuntu, где администратор — системный postgres, оберни psql в
+   `sudo --preserve-env=AGENTS_KB_PASSWORD -u postgres psql -X -q -v ON_ERROR_STOP=1 -d postgres -f set-role-password.sql`.
+   set-role-password.sql берёт значение из окружения процесса и ничего не печатает.
+4. В pg_hba.conf для `agents_student_kb`/`agents_student` с 127.0.0.1 — `scram-sha-256`.
+   Homebrew на Mac по умолчанию ставит `trust` для 127.0.0.1: doctor предупредит об этом;
+   смени на scram-sha-256 для этой базы (остальные строки не трогай) и перезапусти
+   PostgreSQL. После этого агенты и индексатор получают пароль только через
+   `vault-mcp`/`vault-run`.
+5. `student_tools.py --config SETTINGS doctor` (через vault-run): проверит имя базы,
+   что runtime-пользователь не суперпользователь и не владелец, права и vector(1024).
 
 Схема сохраняет основу Team KB: team_kb_documents/chunks/migrations, полный
 текст и hash источника, специализацию, проект, provenance, чанки и vector(1024),
@@ -154,8 +188,25 @@ HNSW/лексический индекс. student_tools.py объединяет 
 персональными ограничениями и карточками исправлений. Не заявляй полную
 эквивалентность этому плагину без отдельного переноса и проверки.
 
-Ollama должен слушать только loopback. Скачай bge-m3 командой `ollama pull bge-m3`,
-если его нет. При обрыве или ошибке 5xx повтори не больше 3 раз с паузой 10–30 с;
+Ollama должен слушать только loopback. Если Ollama ещё нет — ставь только
+закреплённый выпуск **v0.40.11** с GitHub, сверив SHA-256 до распаковки (не
+`curl | sh` вслепую):
+
+| ОС | Файл (https://github.com/ollama/ollama/releases/download/v0.40.11/…) | SHA-256 |
+|---|---|---|
+| macOS | `ollama-darwin.tgz` | `aea7d3f2e32371b7644a6e2ec8d4f26820a0e3965918cce8a46cef3e947f6291` |
+| Ubuntu x86_64 | `ollama-linux-amd64.tar.zst` | `7bedab90dd122661be78798e9f0edf37fccf0cccf2699d2c58ea1a3afdc04b6d` |
+| Ubuntu arm64 | `ollama-linux-arm64.tar.zst` | `77b278837b9e62c172f77d703675be4c52c8054e9075639031a9a6d5a53f1924` |
+
+При 5xx/обрыве — до 3 повторов с паузой, затем запасной путь через API
+(`api.github.com/repos/ollama/ollama/releases/tags/v0.40.11`, ассет с
+`Accept: application/octet-stream`), SHA сверяй всегда. Распакуй в папку
+пользователя установки и запусти `ollama serve` управляемой службой с
+`OLLAMA_HOST=127.0.0.1:11434` (LaunchAgent на Mac, systemd на Ubuntu). Уже стоящий
+Ollama переиспользуй, если он отвечает на loopback.
+
+Скачай bge-m3 командой `ollama pull bge-m3`, если его нет (загрузка по digest Ollama
+не поддерживает). При обрыве или ошибке 5xx повтори не больше 3 раз с паузой 10–30 с;
 если не вышло — честно остановись на этом шаге. Затем
 `student_tools.py --config SETTINGS model-check`: модель ЗАКРЕПЛЕНА, нужен ровно
 digest `7907646426070047a77226ac3e684fbbe8410524f7b4a74d02837e43f2146bab`
@@ -247,7 +298,7 @@ MCP config содержит только команду и пути, не сек
 переиндексирует только изменённый текст и мягко архивирует исчезнувшие/исключённые
 источники. Исходные файлы не удаляются, прежние записи остаются в истории.
 Настрой отдельную управляемую службу под пользователем: LaunchAgent на Mac,
-systemd на Ubuntu, Scheduled Task на Windows. Не используй cron каждую минуту
+systemd на Ubuntu. Не используй cron каждую минуту
 и не оставляй бесконтрольный процесс терминала. Сохраняй очищенный журнал,
 ограничь его размер. Если после reboot недоступен Bitwarden, состояние должно
 быть «нужен unlock», а не «всё работает».
@@ -267,8 +318,7 @@ faster-whisper. Это разные backend, команды нельзя пут�
 
 Если нужен fallback и доступны бинарные wheels для ОС/архитектуры, установи
 requirements-whisper.lock (`pip install --require-hashes -r requirements-whisper.lock`)
-в отдельный venv. Не устанавливай CUDA по умолчанию. Windows ARM64 этот выпуск
-не поддерживает.
+в отдельный venv. Не устанавливай CUDA по умолчанию.
 
 Для нового CPU fallback базовый выбор — multilingual small. Это не точная
 копия всех весов автора; при уже установленной модели используй её. Если
@@ -318,8 +368,8 @@ browser_* инструменты из Hermes удалены, единствен�
 `user_data_dir` = `<профиль>/browser-profile-tooling`. Не включай
 `use_real_profile` и не указывай `cdp_url` на браузер пользователя.
 Smoke: `PYTHON browser-smoke.py --hermes-python HERMES_PYTHON --hermes-home ПРОФИЛЬ`,
-где HERMES_PYTHON — `~/.hermes/hermes-agent/venv/bin/python` (на Windows —
-`%LOCALAPPDATA%\hermes\hermes-agent\venv\Scripts\python.exe`). Hermes сам находит Chromium и строит команду
+где HERMES_PYTHON — `~/.hermes/hermes-agent/venv/bin/python` (browser-smoke.py
+работает и на Python 3.9, но запускай его этим Python Hermes). Hermes сам находит Chromium и строит команду
 запуска по своим правилам; тест подменяет только стартовую страницу.
 
 **Hermes до 0.23 (`browserMode: agent-browser`).** Для локальных браузерных

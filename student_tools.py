@@ -92,6 +92,7 @@ def fetch_whisper_model(model,download=None,sleep=time.sleep):
     """Download the pinned faster-whisper-small into model/, verify every SHA-256, then publish."""
     model=guard(model)
     if model.is_dir() and not model_problems(model):return {'changed':False,'model':str(model),'verified':True}
+    if model.is_dir() and not any(model.iterdir()):model.rmdir()  # an empty folder made in advance
     if model.exists():
         raise StudentFacingError('В папке модели уже есть файлы, которые не совпадают с закреплённой моделью. '
                                  'Я их не трогаю. Выбери новую пустую папку для модели.')
@@ -136,8 +137,9 @@ def model_check(cfg,opener=None,sleep=time.sleep):
     got=selected.get('digest','').removeprefix('sha256:')
     if got!=BGE_M3_DIGEST:
         raise StudentFacingError('Модель bge-m3 в Ollama не совпадает с закреплённой (digest '+got[:12]+'…, нужен '
-                                 +BGE_M3_DIGEST[:12]+'…). Индекс не создаётся. Не продолжай с другой моделью: '
-                                 'сообщи в поддержку.')
+                                 +BGE_M3_DIGEST[:12]+'…). Индекс не создаётся. Выполни один раз `ollama pull bge-m3` '
+                                 '(обновит устаревшую модель) и повтори model-check; если digest снова другой — '
+                                 'не продолжай с другой моделью, сообщи в поддержку.')
     return {'model':'bge-m3','digest':BGE_M3_DIGEST,'verified':True}
 
 
@@ -189,7 +191,7 @@ def candidates(root):
         dirs[:]=[n for n in dirs if n not in EXCLUDED and not n.startswith('.') and not (Path(folder)/n).is_symlink()]
         for name in sorted(files):
             path=Path(folder)/name
-            if name in EXCLUDED or name.startswith('.') or path.suffix.lower() not in EXTENSIONS:continue
+            if name in EXCLUDED or name.startswith(('.','~$')) or path.suffix.lower() not in EXTENSIONS:continue
             if path.suffix.lower() in {'.json','.yaml','.yml'} and re.match(r'(?i)(auth|cookies?|credentials?|tokens?|sessions?)(?:[._-]|$)',name):continue
             if path.is_symlink():continue
             st=path.stat()
@@ -251,14 +253,40 @@ def doctor(cfg):
         identity=db.run('SELECT current_database(),current_user')[0]
         if list(identity)!=[cfg['database']['name'],cfg['database']['user']]:
             raise ValueError('Connected database identity differs from settings')
-        if db.run('SELECT rolsuper FROM pg_roles WHERE rolname=current_user')[0][0]:
-            raise ValueError('Use a dedicated non-superuser runtime account')
+        role=db.run('SELECT rolsuper,rolcreaterole,rolcreatedb FROM pg_roles WHERE rolname=current_user')[0]
+        if role[0]:raise StudentFacingError('База знаний открыта суперпользователем. Нужен отдельный пользователь без прав администратора (agents_student).')
+        if db.run('SELECT pg_get_userbyid(datdba)=current_user FROM pg_database WHERE datname=current_database()')[0][0]:
+            raise StudentFacingError('Пользователь агентов владеет базой знаний. Владельцем должен быть администратор БД, агентам — только grants.sql.')
+        needed=[('team_kb_documents','SELECT'),('team_kb_documents','INSERT'),('team_kb_documents','UPDATE'),
+                ('team_kb_chunks','SELECT'),('team_kb_chunks','INSERT'),('team_kb_chunks','UPDATE')]
+        missing=[t+':'+priv for t,priv in needed if not db.run('SELECT has_table_privilege(current_user,:t,:p)',t=t,p=priv)[0][0]]
+        if missing:raise StudentFacingError('Не хватает прав пользователя агентов: '+', '.join(missing)+'. Примени grants.sql.')
+        extra=[t+':'+priv for t in ('team_kb_documents','team_kb_chunks') for priv in ('DELETE','TRUNCATE')
+               if db.run('SELECT has_table_privilege(current_user,:t,:p)',t=t,p=priv)[0][0]]
         column=db.run("SELECT format_type(atttypid,atttypmod) FROM pg_attribute WHERE attrelid='team_kb_chunks'::regclass AND attname='embedding'")
         if not column or column[0][0]!='vector(1024)':raise ValueError('Unexpected vector schema')
         db.run('ROLLBACK')
     finally:db.close()
+    warnings=[]
+    if role[1] or role[2]:warnings.append('Пользователь агентов может создавать роли или базы; эти права ему не нужны.')
+    if extra:warnings.append('У пользователя агентов лишние права: '+', '.join(extra)+'; достаточно grants.sql.')
+    if passwordless_login(cfg):
+        warnings.append('База знаний пускает пользователя агентов без пароля (trust в pg_hba.conf для 127.0.0.1). '
+                        'Для своей машины лучше scram-sha-256 и пароль из Bitwarden (FOR-CODEX, раздел 4).')
     vector=embed(cfg,['Synthetic student tooling health check'])[0]
-    return {'ready':True,'databaseIdentityVerified':True,'runtimeIsSuperuser':False,'embeddingDimensions':len(vector),'local':True}
+    return {'ready':True,'databaseIdentityVerified':True,'runtimeIsSuperuser':False,'runtimeOwnsDatabase':False,
+            'embeddingDimensions':len(vector),'local':True,'warnings':warnings}
+
+
+def passwordless_login(cfg):
+    """True when the runtime role logs in over TCP with no password at all (trust)."""
+    import pg8000.native
+    db=cfg['database']
+    try:
+        pg8000.native.Connection(user=db['user'],database=db['name'],host=db.get('host','127.0.0.1'),
+                                 port=int(db.get('port',5432)),password=None,timeout=10).close()
+        return True
+    except Exception:return False
 
 
 def index(cfg):
@@ -269,13 +297,20 @@ def index(cfg):
         # Test-only: disposable acceptance VMs index a few real files per root with the
         # real model and database instead of hours of CPU embedding. Never set for students.
         qa_limit=int(os.environ.get('AGENTS_TOOLING_QA_MAX_FILES') or 0)
+        broken=[]
         for source in cfg['roots']:
             seen=[]
             for count,path in enumerate(candidates(source['path'])):
                 if qa_limit and count>=qa_limit:break
                 logical_id='student:'+digest((str(path)+'\n'+source['project']).encode())
                 try:text=text_of(path)
-                except (ValueError,UnicodeError):skipped+=1;continue
+                except Exception as error:
+                    # A damaged PDF/DOCX (PdfStreamError, BadZipFile, ...) or a refused secret is
+                    # skipped and named by path only; the rest of the index keeps going.
+                    skipped+=1
+                    if len(broken)<50:broken.append({'file':str(path),'reason':type(error).__name__})
+                    print(json.dumps({'status':'source-skipped','file':str(path),'reason':type(error).__name__},ensure_ascii=False),file=sys.stderr,flush=True)
+                    continue
                 if not text.strip():skipped+=1;continue
                 content_hash=digest(text.encode())
                 seen.append(logical_id)
@@ -310,7 +345,7 @@ def index(cfg):
                 AND metadata->>'root'=:root AND metadata->>'project'=:project
                 AND NOT ((metadata->>'logical_id')=ANY(CAST(:seen AS text[])))""",
                 root=str(Path(source['path'])),project=source['project'],seen=seen)
-        return {'documentsWritten':written,'unchanged':unchanged,'skipped':skipped}
+        return {'documentsWritten':written,'unchanged':unchanged,'skipped':skipped,'skippedFiles':broken}
     finally:db.close()
 
 

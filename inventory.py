@@ -67,10 +67,17 @@ def browser_mode(version):
 
 def scan(home=None,hermes_home=None):
     home=Path(home) if home is not None else Path.home()
-    roots=[Path(hermes_home)] if hermes_home else [home/'.hermes',home/'AppData/Local/hermes/.hermes']
+    # Windows: the official Hermes lives in %LOCALAPPDATA%\\hermes (Windows v3); the
+    # nested .hermes is the layout of older Windows helpers.
+    local=os.environ.get('LOCALAPPDATA')
+    windows=[Path(local)/'hermes'] if local and platform.system()=='Windows' else []
+    roots=[Path(hermes_home)] if hermes_home else [home/'.hermes',*windows,home/'AppData/Local/hermes',home/'AppData/Local/hermes/.hermes']
     profiles=[];version=None;mcp_client=None
+    seen=set()
     for root in roots:
-        if root.is_symlink():continue
+        key=os.path.normcase(str(root.absolute()))
+        if key in seen or root.is_symlink():continue
+        seen.add(key)
         if root.is_dir() and version is None:version=hermes_version(root);mcp_client=hermes_mcp_client(root)
         for name in PROFILES:
             folder=root/'profiles'/name

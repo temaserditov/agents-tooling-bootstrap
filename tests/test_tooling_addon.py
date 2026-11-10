@@ -269,4 +269,198 @@ class LocalPostgres(unittest.TestCase):
                 subprocess.run([str(bindir/'pg_ctl'),'-D',str(data),'-m','fast','-w','stop'],check=True,capture_output=True)
 
 
+
+def load(name,file):
+    spec=importlib.util.spec_from_file_location(name,ADDON/file)
+    module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);return module
+
+
+class FakeHTTPError(Exception):
+    def __init__(self,code):self.code=code
+
+
+class PinsAndRetries(unittest.TestCase):
+    """Pinned models are a hard stop; network trouble is retried a bounded number of times."""
+    def fixture_pins(self,tmp):
+        files={'config.json':b'{"fixture":1}','model.bin':b'weights','tokenizer.json':b'{}','vocabulary.txt':b'a\nb'}
+        pins={n:__import__('hashlib').sha256(d).hexdigest() for n,d in files.items()}
+        def download(target,data=files):
+            Path(target).mkdir(parents=True,exist_ok=True)
+            for n,d in data.items():(Path(target)/n).write_bytes(d)
+            (Path(target)/'.cache').mkdir(exist_ok=True)
+        return files,pins,download
+
+    def test_whisper_model_verified_published_and_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            files,pins,download=self.fixture_pins(tmp)
+            target=Path(tmp).resolve()/'models/small'
+            with patch.dict(tools.WHISPER_FILES,pins,clear=True):
+                first=tools.fetch_whisper_model(target,download=download,sleep=lambda s:None)
+                self.assertTrue(first['changed']);self.assertEqual(sorted(p.name for p in target.iterdir()),sorted(files))
+                self.assertEqual(tools.fetch_whisper_model(target,download=lambda t:self.fail('no second download'))['changed'],False)
+                self.assertEqual(list(target.parent.glob('.small.download-*')),[])
+
+    def test_whisper_model_hash_mismatch_is_a_hard_stop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            files,pins,download=self.fixture_pins(tmp)
+            bad={**files,'model.bin':b'tampered'}
+            target=Path(tmp).resolve()/'models/small'
+            with patch.dict(tools.WHISPER_FILES,pins,clear=True):
+                with self.assertRaises(tools.StudentFacingError) as caught:
+                    tools.fetch_whisper_model(target,download=lambda t:download(t,bad),sleep=lambda s:None)
+                self.assertIn('model.bin',str(caught.exception));self.assertIn('не установлена',str(caught.exception))
+                self.assertFalse(target.exists());self.assertEqual(list(target.parent.iterdir()),[])
+                # An unknown non-empty folder is the student's: never overwritten.
+                target.mkdir();(target/'model.bin').write_bytes(b'other')
+                with self.assertRaises(tools.StudentFacingError):tools.fetch_whisper_model(target,download=download)
+                self.assertEqual((target/'model.bin').read_bytes(),b'other')
+
+    def test_transcribe_refuses_an_unpinned_model_before_loading(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            model=Path(tmp).resolve()/'m';model.mkdir();(model/'model.bin').write_bytes(b'x')
+            audio=Path(tmp).resolve()/'a.wav';audio.write_bytes(b'RIFF')
+            with self.assertRaises(tools.StudentFacingError):tools.transcribe(model,audio,Path(tmp).resolve()/'out.json')
+            self.assertFalse((Path(tmp).resolve()/'out.json').exists())
+
+    def test_transient_failures_are_retried_then_reported_honestly(self):
+        calls=[];pauses=[]
+        def flaky():
+            calls.append(1)
+            if len(calls)<3:raise FakeHTTPError(503)
+            return 'ok'
+        self.assertEqual(tools.with_retries(flaky,'fixture',sleep=pauses.append),'ok')
+        self.assertEqual(len(calls),3);self.assertEqual(len(pauses),2)
+        def down():raise TimeoutError()
+        with self.assertRaises(tools.StudentFacingError) as caught:tools.with_retries(down,'Hugging Face',attempts=3,sleep=pauses.append)
+        self.assertIn('3 попыток',str(caught.exception));self.assertIn('ничего не пропускай',str(caught.exception))
+        missing=[]
+        def gone():missing.append(1);raise FakeHTTPError(404)
+        with self.assertRaises(FakeHTTPError):tools.with_retries(gone,'fixture',sleep=pauses.append)
+        self.assertEqual(len(missing),1)
+
+    def test_bge_m3_digest_is_pinned(self):
+        class Opener:
+            def __init__(self,answers):self.answers=list(answers)
+            def open(self,url,timeout=None):
+                answer=self.answers.pop(0)
+                if isinstance(answer,Exception):raise answer
+                import io as _io
+                class R(_io.BytesIO):
+                    def __enter__(self):return self
+                    def __exit__(self,*a):return False
+                return R(json.dumps(answer).encode())
+        good={'models':[{'name':'bge-m3:latest','digest':tools.BGE_M3_DIGEST}]}
+        other={'models':[{'name':'bge-m3:latest','digest':'0'*64}]}
+        self.assertTrue(tools.model_check({},Opener([FakeHTTPError(503),good]),sleep=lambda s:None)['verified'])
+        with self.assertRaises(tools.StudentFacingError) as caught:tools.model_check({},Opener([other]))
+        self.assertIn('Индекс не создаётся',str(caught.exception))
+        with self.assertRaises(tools.StudentFacingError):tools.model_check({},Opener([{'models':[]}]))
+        with tempfile.TemporaryDirectory() as tmp:
+            settings=Path(tmp).resolve()/'settings.json'
+            settings.write_text(json.dumps({'schemaVersion':1,'embeddingModel':'bge-m3','embeddingDimensions':1024,'embeddingDigest':'1'*64,'roots':[]}))
+            with self.assertRaises(tools.StudentFacingError):tools.config(settings)
+            settings.write_text(json.dumps({'schemaVersion':1,'embeddingModel':'bge-m3','embeddingDimensions':1024,'embeddingDigest':tools.BGE_M3_DIGEST,'roots':[]}))
+            self.assertEqual(tools.config(settings)['embeddingDigest'],tools.BGE_M3_DIGEST)
+
+    def test_student_facing_errors_are_printed_as_is_and_others_suppressed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run=lambda *a:subprocess.run([sys.executable,'-B',str(ADDON/'student_tools.py'),*a],capture_output=True,text=True)
+            model=Path(tmp).resolve()/'m';model.mkdir();(model/'model.bin').write_bytes(b'x');audio=Path(tmp).resolve()/'a.wav';audio.write_bytes(b'R')
+            r=run('transcribe','--model-dir',str(model),'--audio',str(audio),'--output',str(Path(tmp).resolve()/'o.json'))
+            self.assertEqual(r.returncode,2);self.assertIn('не совпадает с закреплённой',r.stderr)
+            r=run('--config',str(Path(tmp).resolve()/'missing.json'),'doctor')
+            self.assertEqual(r.returncode,1);self.assertIn('raw error suppressed',r.stderr);self.assertNotIn(tmp,r.stderr)
+
+
+class Idempotency(unittest.TestCase):
+    """Repeated bootstrap writes nothing; secrets and sessions are never opened or copied."""
+    CANARY='CANARY-7f3c9e1a-SECRET'
+
+    def install(self,root):
+        import yaml
+        home=root/'hermes'
+        for name in ['tech','copywriter']:
+            folder=home/'profiles'/name;(folder/'skills/s').mkdir(parents=True)
+            (folder/'skills/s/SKILL.md').write_text('# Skill '+name)
+            (folder/'AGENTS.md').write_text('# '+name+'\nMy own rule.\n')
+            (folder/'SOUL.md').write_text('# Soul '+name+'\n')
+            (folder/'config.yaml').write_text(yaml.safe_dump({'model':{'provider':'x'}}))
+            (folder/'auth.json').write_text(self.CANARY);(folder/'.env').write_text('KEY='+self.CANARY)
+            (folder/'sessions').mkdir();(folder/'sessions/chat.json').write_text(self.CANARY)
+        (home/'.env').write_text('TELEGRAM_BOT_TOKEN='+self.CANARY);(home/'auth.json').write_text(self.CANARY)
+        (home/'telegram.session').write_text(self.CANARY)
+        bw=root/'bitwarden';bw.mkdir();(bw/'data.json').write_text(self.CANARY)
+        settings=root/'tooling/settings.json';settings.parent.mkdir()
+        settings.write_text((ADDON/'settings.example.json').read_text())
+        return home,settings
+
+    def test_second_bootstrap_changes_nothing(self):
+        bootstrap=load('tooling_bootstrap_idem','bootstrap.py')
+        with tempfile.TemporaryDirectory() as tmp:
+            home,settings=self.install(Path(tmp).resolve())
+            first=bootstrap.prepare(home,settings)
+            self.assertTrue(first['changed']);self.assertGreater(first['changedFiles'],0)
+            second=bootstrap.prepare(home,settings)
+            self.assertIs(second['changed'],False);self.assertEqual(second['changedFiles'],0);self.assertIsNone(second['backup'])
+
+    def test_secrets_and_sessions_are_never_opened_or_copied(self):
+        bootstrap=load('tooling_bootstrap_secret','bootstrap.py');inventory=load('tooling_inventory_secret','inventory.py')
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp).resolve();home,settings=self.install(root)
+            protected={str(p) for p in root.rglob('*') if p.is_file() and self.CANARY in p.read_text()}
+            opened=[]
+            def hook(event,args):
+                if event=='open' and args and isinstance(args[0],(str,bytes,os.PathLike)):
+                    path=os.fsdecode(args[0]);path=str(Path(path).resolve()) if os.path.isabs(path) else path
+                    if path in protected:opened.append(path)
+            sys.addaudithook(hook)
+            with patch.dict(os.environ,{'BWS_ACCESS_TOKEN':self.CANARY,'BW_SESSION':self.CANARY}):
+                out=json.dumps(inventory.scan(home=root,hermes_home=home))+json.dumps(bootstrap.prepare(home,settings))
+            hook_active=list(opened);opened.clear()
+            self.assertEqual(hook_active,[],'protected files were opened')
+            self.assertNotIn(self.CANARY,out)
+            for path in (root/'tooling').rglob('*'):
+                if path.is_file():self.assertNotIn(self.CANARY,path.read_text(errors='replace'),str(path))
+            for path in home.rglob('*'):
+                if path.is_file() and str(path) not in protected:self.assertNotIn(self.CANARY,path.read_text(errors='replace'),str(path))
+
+    def test_tooling_block_survives_repeated_runs_and_an_update_rewrite(self):
+        bootstrap=load('tooling_bootstrap_block','bootstrap.py')
+        with tempfile.TemporaryDirectory() as tmp:
+            home,settings=self.install(Path(tmp).resolve())
+            bootstrap.prepare(home,settings);bootstrap.prepare(home,settings)
+            agents=home/'profiles/tech/AGENTS.md'
+            text=agents.read_text()
+            self.assertEqual(text.count(bootstrap.BEGIN),1);self.assertEqual(text.count(bootstrap.END),1);self.assertIn('My own rule.',text)
+            # A tariff update rewrites the file around the block (FIX_0495 merge keeps it).
+            agents.write_text(text.replace('My own rule.','My own rule.\nNew course rule.'))
+            third=bootstrap.prepare(home,settings)
+            text=agents.read_text()
+            self.assertEqual(text.count(bootstrap.BEGIN),1);self.assertIn('New course rule.',text);self.assertIn('My own rule.',text)
+            self.assertIs(bootstrap.prepare(home,settings)['changed'],False)
+            self.assertTrue(third['changed'])  # only the index snapshot of the instructions moved
+
+
+class PublicBundle(unittest.TestCase):
+    """The release builder refuses personal data; the committed tree carries none."""
+    def builder(self):
+        path=ADDON/'release/build.py'
+        if not path.is_file():self.skipTest('release builder not shipped in the bundle')
+        spec=importlib.util.spec_from_file_location('tooling_release',path)
+        module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);return module
+
+    def test_scanner_catches_personal_data(self):
+        b=self.builder()
+        # Built at run time so this file itself stays clean for the same scanner.
+        u,v,d='/Us'+'ers/','/Vol'+'umes/','DI'+'AG-'
+        sample={'a.md':(u+'somebody/x mail someone'+'@gm'+'ail.com '+d+'MAC-ABCDEF12 C:\\'+'Users\\Someone\\x '+v+'Disk/x 123456789:'+'A'*35).encode()}
+        labels={x[1].split(':')[0] for x in b.private_findings(sample)}
+        self.assertEqual(labels,{'host path','e-mail','learner id','host volume','bot token'})
+        self.assertEqual(b.private_findings({'b.md':b'/home/x/fixture %LOCALAPPDATA%\\hermes C:\\Users\\USER\\x'}),[])
+
+    def test_every_shipped_file_is_clean(self):
+        b=self.builder()
+        files={n:(ADDON/n).read_bytes() for n in subprocess.check_output(['git','ls-files','-z'],cwd=ADDON).decode().split('\0') if n and not b.EXCLUDE.match(n)}
+        self.assertEqual(b.private_findings(files),[])
+
 if __name__=='__main__':unittest.main()

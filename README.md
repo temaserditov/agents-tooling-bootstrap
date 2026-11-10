@@ -35,12 +35,18 @@ Telegram Reader исключён и не переавторизуется. Па�
 
 В отдельном Python 3.11–3.13 установите requirements.lock с проверкой хешей.
 `AGENTS_TOOLING_SOURCE=. python -B tests/test_tooling_addon.py` проверяет чистые
-функции и настоящий stdio MCP. Флаг `--postgres` поднимает отдельный временный
-PostgreSQL cluster с pgvector; рабочие БД не использует.
+функции, настоящий stdio MCP, закреплённые модели (несовпадение SHA-256/digest —
+жёсткий отказ), ограниченные повторы при 5xx/таймаутах, повторный bootstrap без
+изменений (`changed: false`), что секреты и сессии не открываются и не копируются,
+и что в публичном пакете нет личных данных. Флаг `--postgres` поднимает отдельный
+временный PostgreSQL cluster с pgvector; рабочие БД не использует.
 
-Hermes 0.21–0.22 и 0.23 поддерживаются: в 0.23 нет agent-browser, браузер — собственный
-Chromium Hermes (`hermes pm install chromium`), постоянный профиль — `browser.user_data_dir`.
+Порядок для ученика: сначала патч агентов v2026.11.10.2 и штатное обновление
+(Hermes 0.23.0), затем это дооснащение. Hermes 0.21–0.22 код понимает: в 0.23 нет
+agent-browser, браузер — собственный Chromium Hermes (`hermes pm install chromium`),
+постоянный профиль — `browser.user_data_dir`.
 
-Проверены синтетические сценарии на macOS. Полный ASR, установка программ и
-Windows/Ubuntu требуют реальной приёмки целевого устройства; не считать их
-автоматически принятыми по наличию архива.
+Закреплено: Systran/faster-whisper-small `536b0662…` (SHA-256 каждого файла),
+Ollama bge-m3 digest `79076464…`. Таблица поддержки ОС — в FOR-CODEX.md, раздел 0.
+Windows ARM64 не поддерживается. Релиз собирается `release/build.py` из
+закоммиченного дерева (ZIP + manifest + SHA256SUMS + INSTALL-AGENTS-TOOLS.md).

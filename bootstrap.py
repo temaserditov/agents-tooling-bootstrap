@@ -164,7 +164,7 @@ def prepare(hermes_home,settings,via_vault=False,initial_index=False,enable_brow
     result={'profiles':names,'hermesVersion':state['hermesVersion'],'browserMode':state['browserMode'],
             'hermesMcpClient':state.get('hermesMcpClient'),
             'nextSteps':(['hermes pm install --extra mcp'] if state.get('hermesMcpClient') is False else []),
-            'registeredRoots':len(roots),'changedFiles':len(plan),
+            'registeredRoots':len(roots),'changedFiles':len(plan),'changed':bool(plan),
             'unreadableInstructions':sorted(set(unreadable)),
             'backup':str(backup) if plan else None,'gatewayReloadRequired':bool(plan),'telegramReaderChanged':False}
     if initial_index:

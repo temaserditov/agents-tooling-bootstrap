@@ -11,6 +11,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -28,6 +29,118 @@ EXCLUDED={'auth.json','config.yaml','sessions','logs','backups','cache','.git','
           '.obsidian','cookies','credentials','secrets'}
 EXTENSIONS={'.md','.txt','.pdf','.docx','.py','.sh','.ps1','.js','.mjs','.ts',
             '.json','.yaml','.yml','.csv','.html','.css','.sql'}
+# Pinned public models. A different file or digest is a hard stop, never "continue as is".
+WHISPER_REPO='Systran/faster-whisper-small'
+WHISPER_REVISION='536b0662742c02347bc0e980a01041f333bce120'
+WHISPER_FILES={'config.json':'b55496ac7940a7ae47d2c01eab40edfd8701feec1229d9cce3b40014383fb828',
+               'model.bin':'3e305921506d8872816023e4c273e75d2419fb89b24da97b4fe7bce14170d671',
+               'tokenizer.json':'fb7b63191e9bb045082c79fd742a3106a12c99513ab30df4a0d47fa6cb6fd0ab',
+               'vocabulary.txt':'34ce3fe1c5041027b3f8d42912270993f986dbc4bb34cf27f951e34a1e453913'}
+# Ollama manifest digest of library/bge-m3:latest (F16, 566.70M, 1024 dimensions), 10.11.2026.
+BGE_M3_DIGEST='7907646426070047a77226ac3e684fbbe8410524f7b4a74d02837e43f2146bab'
+RETRY_ATTEMPTS=4
+RETRY_PAUSE_SECONDS=5
+
+
+class StudentFacingError(ValueError):
+    """A failure whose message is safe and meant to be shown to the student as is."""
+
+
+def transient(error):
+    """True for a 5xx/429, a timeout or a dropped connection: worth a bounded retry."""
+    status=getattr(error,'code',None)
+    response=getattr(error,'response',None)
+    if status is None and response is not None:status=getattr(response,'status_code',None)
+    if status is None:status=getattr(error,'status_code',None)
+    if isinstance(status,int):return status>=500 or status==429
+    if isinstance(error,(TimeoutError,ConnectionError)):return True
+    import urllib.error
+    if isinstance(error,urllib.error.URLError):return True
+    name=type(error).__name__.lower()
+    return 'timeout' in name or 'connect' in name or 'network' in name
+
+
+def with_retries(action,what,attempts=None,pause=None,sleep=time.sleep):
+    """Run action(); repeat only transient failures, a bounded number of times, then say so."""
+    attempts=attempts or RETRY_ATTEMPTS;pause=RETRY_PAUSE_SECONDS if pause is None else pause
+    for attempt in range(1,attempts+1):
+        try:return action()
+        except StudentFacingError:raise
+        except Exception as error:
+            if not transient(error):raise
+            if attempt==attempts:
+                raise StudentFacingError(f'{what}: сервис не ответил после {attempts} попыток '
+                                         f'(временная ошибка сети или сервера: {type(error).__name__}). '
+                                         'Ничего не установлено. Повтори позже; ничего не пропускай.') from None
+            sleep(pause*attempt)
+
+
+def model_problems(model):
+    """Files of the pinned Whisper model that are missing or differ, as names."""
+    model=Path(model);bad=[]
+    for name,expected in WHISPER_FILES.items():
+        path=model/name
+        if not path.is_file() or path.is_symlink():bad.append(name);continue
+        h=hashlib.sha256()
+        with path.open('rb') as f:
+            for block in iter(lambda:f.read(1<<20),b''):h.update(block)
+        if h.hexdigest()!=expected:bad.append(name)
+    return bad
+
+
+def fetch_whisper_model(model,download=None,sleep=time.sleep):
+    """Download the pinned faster-whisper-small into model/, verify every SHA-256, then publish."""
+    model=guard(model)
+    if model.is_dir() and not model_problems(model):return {'changed':False,'model':str(model),'verified':True}
+    if model.exists():
+        raise StudentFacingError('В папке модели уже есть файлы, которые не совпадают с закреплённой моделью. '
+                                 'Я их не трогаю. Выбери новую пустую папку для модели.')
+    if download is None:
+        from huggingface_hub import snapshot_download
+        download=lambda target:snapshot_download(WHISPER_REPO,revision=WHISPER_REVISION,local_dir=str(target),
+                                                  allow_patterns=sorted(WHISPER_FILES),token=False)
+    stage=model.with_name('.'+model.name+'.download-'+uuid.uuid4().hex[:12])
+    stage.parent.mkdir(parents=True,exist_ok=True)
+    try:
+        with_retries(lambda:download(stage),'Загрузка модели Whisper с Hugging Face',sleep=sleep)
+        bad=model_problems(stage)
+        if bad:
+            raise StudentFacingError('Скачанная модель Whisper не совпадает с закреплённой (SHA-256: '+', '.join(bad)+'). '
+                                     'Модель не установлена и не используется. Не продолжай с другой моделью: '
+                                     'проверь прокси/VPN и повтори; если повторяется — сообщи в поддержку.')
+        for extra in list(stage.iterdir()):
+            if extra.name not in WHISPER_FILES:
+                if extra.is_dir():shutil.rmtree(extra)
+                else:extra.unlink()
+        os.replace(stage,model)
+    finally:
+        if stage.exists():
+            shutil.rmtree(stage,ignore_errors=True)
+    return {'changed':True,'model':str(model),'verified':True,'revision':WHISPER_REVISION}
+
+
+def ollama_tags(cfg,opener=None,sleep=time.sleep):
+    url=cfg.get('ollamaUrl','http://127.0.0.1:11434')
+    if opener is None:opener=urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    def read():
+        with opener.open(url.rstrip('/')+'/api/tags',timeout=15) as response:return json.load(response)
+    return with_retries(read,'Локальный Ollama',sleep=sleep)
+
+
+def model_check(cfg,opener=None,sleep=time.sleep):
+    """The installed bge-m3 must be exactly the pinned one; anything else stops."""
+    tags=ollama_tags(cfg,opener,sleep)
+    selected=next((m for m in tags.get('models',[]) if m.get('name') in {'bge-m3','bge-m3:latest'}),None)
+    if selected is None:
+        raise StudentFacingError('В Ollama нет модели bge-m3. Выполни `ollama pull bge-m3` и повтори проверку.')
+    got=selected.get('digest','').removeprefix('sha256:')
+    if got!=BGE_M3_DIGEST:
+        raise StudentFacingError('Модель bge-m3 в Ollama не совпадает с закреплённой (digest '+got[:12]+'…, нужен '
+                                 +BGE_M3_DIGEST[:12]+'…). Индекс не создаётся. Не продолжай с другой моделью: '
+                                 'сообщи в поддержку.')
+    return {'model':'bge-m3','digest':BGE_M3_DIGEST,'verified':True}
+
+
 SECRET=re.compile(r'-----BEGIN .*PRIVATE KEY-----|\b(?:sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|\d{7,12}:[A-Za-z0-9_-]{30,})|(?:password|api[_-]?key|access[_-]?token)\s*[:=]\s*["\']?[A-Za-z0-9_+/=-]{18,}|postgres(?:ql)?://[^\s:]+:[^\s@]+@',re.I)
 
 
@@ -47,6 +160,10 @@ def config(path):
         raise ValueError('Review embedding schema before changing model or dimensions')
     if any(k in d.get('database',{}) for k in ['password','dsn','connectionString']):
         raise ValueError('Database credentials belong in Bitwarden, not settings.json')
+    recorded=d.get('embeddingDigest','').removeprefix('sha256:')
+    if recorded and recorded!=BGE_M3_DIGEST:
+        raise StudentFacingError('В settings.json записан другой digest bge-m3. Индекс не используется: '
+                                 'нужна закреплённая модель '+BGE_M3_DIGEST[:12]+'…; сообщи в поддержку.')
     for item in d.get('roots',[]):
         root=guard(item['path'])
         if root==Path.home() or len(root.parts)<3 or not item.get('project'):
@@ -105,12 +222,13 @@ def embed(cfg,texts):
     expected=cfg.get('embeddingDigest','')
     if not re.fullmatch(r'(?:sha256:)?[a-f0-9]{64}',expected):
         raise ValueError('Record the installed bge-m3 digest before indexing')
-    with opener.open(url.rstrip('/')+'/api/tags',timeout=15) as response:tags=json.load(response)
-    selected=next((m for m in tags.get('models',[]) if m.get('name') in {'bge-m3','bge-m3:latest'}),None)
-    if selected is None or selected.get('digest','').removeprefix('sha256:')!=expected.removeprefix('sha256:'):
-        raise ValueError('Embedding model changed; preserve DB and review reindex separately')
+    if expected.removeprefix('sha256:')!=BGE_M3_DIGEST:
+        raise StudentFacingError('Записанный digest bge-m3 не совпадает с закреплённым; индекс не используется.')
+    model_check(cfg,opener)
     req=urllib.request.Request(url.rstrip('/')+'/api/embed',data=payload,headers={'Content-Type':'application/json'})
-    with opener.open(req,timeout=120) as response:data=json.load(response)
+    def call():
+        with opener.open(req,timeout=120) as response:return json.load(response)
+    data=with_retries(call,'Локальный Ollama (embeddings)')
     vectors=data.get('embeddings',[])
     if len(vectors)!=len(texts) or any(len(v)!=1024 or any(not isinstance(x,(int,float)) or not math.isfinite(x) for x in v) for v in vectors):
         raise ValueError('Embedding output does not match vector(1024)')
@@ -148,9 +266,13 @@ def index(cfg):
     try:
         if not db.run('SELECT pg_try_advisory_lock(178704291)')[0][0]:
             return {'status':'index-already-running'}
+        # Test-only: disposable acceptance VMs index a few real files per root with the
+        # real model and database instead of hours of CPU embedding. Never set for students.
+        qa_limit=int(os.environ.get('AGENTS_TOOLING_QA_MAX_FILES') or 0)
         for source in cfg['roots']:
             seen=[]
-            for path in candidates(source['path']):
+            for count,path in enumerate(candidates(source['path'])):
+                if qa_limit and count>=qa_limit:break
                 logical_id='student:'+digest((str(path)+'\n'+source['project']).encode())
                 try:text=text_of(path)
                 except (ValueError,UnicodeError):skipped+=1;continue
@@ -261,11 +383,16 @@ def vault_run(cfg,command):
 def transcribe(model,audio,output):
     model=guard(model);audio=guard(audio);output=guard(output)
     if not model.is_dir() or not audio.is_file():raise ValueError('Existing local model and audio file are required')
+    bad=model_problems(model)
+    if bad:
+        raise StudentFacingError('Локальная модель Whisper не совпадает с закреплённой ('+', '.join(bad)+'); '
+                                 'распознавание не запускается. Скачай её заново командой fetch-whisper-model в новую папку.')
+    os.environ['HF_HUB_OFFLINE']='1'
     if output.exists():raise ValueError('Output exists; preserve it')
     from faster_whisper import WhisperModel
     engine=WhisperModel(str(model),device='cpu',compute_type='int8',local_files_only=True)
     segments,info=engine.transcribe(str(audio),vad_filter=True)
-    result={'local':True,'language':info.language,'segments':[{'start':s.start,'end':s.end,'text':s.text} for s in segments]}
+    result={'local':True,'model':WHISPER_REPO+'@'+WHISPER_REVISION,'language':info.language,'segments':[{'start':s.start,'end':s.end,'text':s.text} for s in segments]}
     output.parent.mkdir(parents=True,exist_ok=True)
     with output.open('x',encoding='utf8') as f:json.dump(result,f,ensure_ascii=False,indent=2)
     return {'local':True,'segments':len(result['segments']),'output':str(output)}
@@ -290,10 +417,14 @@ def main():
     w=sub.add_parser('watch');w.add_argument('--interval',type=int,default=300)
     s=sub.add_parser('search');s.add_argument('query');s.add_argument('--profile',choices=list(PROFILES),default='tech');s.add_argument('--project',default='__skills__')
     v=sub.add_parser('vault-run');v.add_argument('args',nargs=argparse.REMAINDER)
+    f=sub.add_parser('fetch-whisper-model');f.add_argument('--model-dir',type=Path,required=True)
+    sub.add_parser('model-check')
     t=sub.add_parser('transcribe');t.add_argument('--model-dir',type=Path,required=True);t.add_argument('--audio',type=Path,required=True);t.add_argument('--output',type=Path,required=True)
     a=p.parse_args()
     if a.command=='transcribe':print(json.dumps(transcribe(a.model_dir,a.audio,a.output),ensure_ascii=False));return
+    if a.command=='fetch-whisper-model':print(json.dumps(fetch_whisper_model(a.model_dir),ensure_ascii=False));return
     cfg=config(a.config)
+    if a.command=='model-check':print(json.dumps(model_check(cfg)));return
     if a.command=='index':print(json.dumps(index(cfg)))
     elif a.command=='doctor':print(json.dumps(doctor(cfg)))
     elif a.command=='search':print(json.dumps(search(cfg,a.query,a.profile,a.project),ensure_ascii=False))
@@ -313,6 +444,10 @@ def main():
 
 if __name__=='__main__':
     try:main()
+    except StudentFacingError as error:
+        # Our own fixed texts (pins, retries): safe and meant for the student.
+        print(json.dumps({'status':'failed','errorClass':'StudentFacingError','message':str(error)},ensure_ascii=False),file=sys.stderr)
+        sys.exit(2)
     except Exception as error:
         # Unknown libraries can embed DSNs or secret values in exception strings.
         print(json.dumps({'status':'failed','errorClass':type(error).__name__,'message':'Check the local setup and service status; raw error suppressed.'}),file=sys.stderr)

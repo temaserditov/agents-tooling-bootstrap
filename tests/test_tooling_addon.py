@@ -441,6 +441,16 @@ class Idempotency(unittest.TestCase):
             self.assertTrue(third['changed'])  # only the index snapshot of the instructions moved
 
 
+class LockedLibraries(unittest.TestCase):
+    """Pinned versions must work together, not only install."""
+    def test_pg8000_calls_only_what_the_pinned_scramp_has(self):
+        # pg8000 1.31.5 called scramp.make_channel_binding, removed in scramp 1.5.0:
+        # every SSL connection (Ubuntu's default PostgreSQL) failed with AttributeError.
+        import inspect,re,scramp,pg8000.core
+        used=set(re.findall(r'\bscramp\.([A-Za-z_]+)',inspect.getsource(pg8000.core)))
+        self.assertTrue(used);self.assertEqual(sorted(n for n in used if not hasattr(scramp,n)),[])
+
+
 class PublicBundle(unittest.TestCase):
     """The release builder refuses personal data; the committed tree carries none."""
     def builder(self):

@@ -48,5 +48,5 @@ agent-browser, браузер — собственный Chromium Hermes (`herme
 
 Закреплено: Systran/faster-whisper-small `536b0662…` (SHA-256 каждого файла),
 Ollama bge-m3 digest `79076464…`. Таблица поддержки ОС — в FOR-CODEX.md, раздел 0.
-Windows ARM64 не поддерживается. Релиз собирается `release/build.py` из
+Windows (x64 и ARM64) в этом выпуске не поддерживается. Релиз собирается `release/build.py` из
 закоммиченного дерева (ZIP + manifest + SHA256SUMS + INSTALL-AGENTS-TOOLS.md).

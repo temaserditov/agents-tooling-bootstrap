@@ -107,7 +107,7 @@ jobs:
           & $psql -h 127.0.0.1 -p 5433 -U postgres -d agents_student_kb -v ON_ERROR_STOP=1 -q -f schema.sql; if($LASTEXITCODE){throw 'schema'}
           & $psql -h 127.0.0.1 -p 5433 -U postgres -d agents_student_kb -v ON_ERROR_STOP=1 -q -c 'GRANT USAGE ON SCHEMA public TO agents_student; GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA public TO agents_student; GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA public TO agents_student;'; if($LASTEXITCODE){throw 'grants'}
           & $psql -h 127.0.0.1 -p 5433 -U postgres -d agents_student_kb -tAc "SELECT extversion FROM pg_extension WHERE extname='vector'"
-      - name: Ollama (pinned release) and the pinned bge-m3
+      - name: Ollama archive (pinned release)
         shell: powershell
         run: |
           $ErrorActionPreference='Stop'
@@ -121,40 +121,42 @@ jobs:
           & tar.exe -xf $zip -C "$env:RUNNER_TEMP\ollama"; if($LASTEXITCODE){throw 'Ollama archive did not unpack'}
           Remove-Item $zip
           if(-not (Test-Path -LiteralPath "$env:RUNNER_TEMP\ollama\ollama.exe")){throw 'ollama.exe missing in the archive'}
-          $env:OLLAMA_HOST='127.0.0.1:11434'
-          Start-Process -FilePath "$env:RUNNER_TEMP\ollama\ollama.exe" -ArgumentList 'serve' -WindowStyle Hidden -RedirectStandardOutput "$env:RUNNER_TEMP\ollama.out" -RedirectStandardError "$env:RUNNER_TEMP\ollama.err"
-          $deadline=(Get-Date).AddSeconds(90);do{try{Invoke-WebRequest -UseBasicParsing http://127.0.0.1:11434/api/tags -TimeoutSec 3|Out-Null;$up=$true}catch{Start-Sleep 2}}until($up -or (Get-Date) -gt $deadline)
-          if(-not $up){throw 'Ollama did not start'}
-          for($i=1;$i -le 3;$i++){& "$env:RUNNER_TEMP\ollama\ollama.exe" pull bge-m3; if($LASTEXITCODE -eq 0){break}; if($i -eq 3){throw 'bge-m3 pull failed'}; Start-Sleep -Seconds (20*$i)}
-      - name: Settings, pinned model check, doctor
-        shell: powershell
-        run: |
-          $ErrorActionPreference='Stop'
-          $py="$env:RUNNER_TEMP\tv\Scripts\python.exe";$t="$env:RUNNER_TEMP\tooling";New-Item -ItemType Directory -Force $t|Out-Null
-          $c=Get-Content settings.example.json -Raw|ConvertFrom-Json
-          $c.embeddingDigest='7907646426070047a77226ac3e684fbbe8410524f7b4a74d02837e43f2146bab'
-          $c.database.host='127.0.0.1';$c.database|Add-Member -NotePropertyName port -NotePropertyValue 5433 -Force
-          $c.database.name='agents_student_kb';$c.database.user='agents_student'
-          [IO.File]::WriteAllText("$t\settings.json",($c|ConvertTo-Json -Depth 8))
-          & $py -B student_tools.py --config "$t\settings.json" model-check; if($LASTEXITCODE){exit 1}
-          & $py -B student_tools.py --config "$t\settings.json" doctor; if($LASTEXITCODE){exit 1}
-      # Cyrillic text: PowerShell 7 reads the step as UTF-8; Windows PowerShell 5.1 would
-      # read the BOM-less script in cp1252 and break its strings.
-      - name: Bootstrap with first index, search, then a repeat that changes nothing
+      # Run 42908480218: an Ollama started with Start-Process in one step was gone in the
+      # next one. Everything that needs the server runs in the step that starts it.
+      # Cyrillic text: PowerShell 7 reads the step as UTF-8.
+      - name: Ollama server, pinned bge-m3, settings, doctor, bootstrap, search and a no-op repeat
         shell: pwsh
         run: |
           $ErrorActionPreference='Stop'
           [Console]::OutputEncoding=[Text.Encoding]::UTF8;$OutputEncoding=[Text.Encoding]::UTF8
-          $py="$env:RUNNER_TEMP\tv\Scripts\python.exe";$t="$env:RUNNER_TEMP\tooling";$h=Join-Path $env:LOCALAPPDATA 'hermes'
-          $first=& $py -B bootstrap.py --hermes-home $h --settings "$t\settings.json" --index | Out-String;"BOOTSTRAP1 $first"
-          $r=$first|ConvertFrom-Json; if($r.status -eq 'failed' -or $r.index.documentsWritten -lt 1 -or -not $r.changed){throw 'first bootstrap failed'}
-          $s=& $py -B student_tools.py --config "$t\settings.json" search "маяк кораблям" --profile tech --project __skills__ | Out-String;"SEARCH $($s.Substring(0,[Math]::Min(400,$s.Length)))"
-          if(@(($s|ConvertFrom-Json).results).Count -lt 1){throw 'search found nothing'}
-          $second=& $py -B bootstrap.py --hermes-home $h --settings "$t\settings.json" --index | Out-String;"BOOTSTRAP2 $second"
-          $r2=$second|ConvertFrom-Json; if($r2.changed -ne $false -or $r2.changedFiles -ne 0){throw 'repeat bootstrap changed files'}
-          foreach($p in 'tech','copywriter'){foreach($f in 'AGENTS.md','SOUL.md'){$x=Get-Content -Raw (Join-Path $h "profiles\$p\$f");$n=([regex]::Matches($x,'agents-student-tooling:start')).Count;if($n -ne 1){throw "block $p/$f=$n"};if($f -eq 'AGENTS.md' -and $x -notmatch 'Личное правило ученика'){throw 'personal text lost'}}}
-          Get-ChildItem -Recurse -File $t | ForEach-Object { if((Get-Content -Raw $_.FullName) -match 'CANARY-WINDOWS-SECRET'){throw "secret copied into $($_.FullName)"} }
-          'TOOLING_IDEMPOTENT changed=false, blocks intact, no secrets copied'
+          $env:OLLAMA_HOST='127.0.0.1:11434'
+          $server=Start-Process -FilePath "$env:RUNNER_TEMP\ollama\ollama.exe" -ArgumentList 'serve' -PassThru -RedirectStandardOutput "$env:RUNNER_TEMP\ollama.out" -RedirectStandardError "$env:RUNNER_TEMP\ollama.err"
+          try{
+            $up=$false;$deadline=(Get-Date).AddSeconds(120)
+            do{try{Invoke-WebRequest -UseBasicParsing http://127.0.0.1:11434/api/tags -TimeoutSec 3|Out-Null;$up=$true}catch{if($server.HasExited){break};Start-Sleep 2}}until($up -or (Get-Date) -gt $deadline)
+            if(-not $up){Get-Content "$env:RUNNER_TEMP\ollama.err" -Tail 30 -ErrorAction SilentlyContinue;throw "Ollama did not start (exited: $($server.HasExited))"}
+            'OLLAMA_UP'
+            for($i=1;$i -le 3;$i++){& "$env:RUNNER_TEMP\ollama\ollama.exe" pull bge-m3; if($LASTEXITCODE -eq 0){break}; if($i -eq 3){throw 'bge-m3 pull failed'}; Start-Sleep -Seconds (20*$i)}
+            $py="$env:RUNNER_TEMP\tv\Scripts\python.exe";$t="$env:RUNNER_TEMP\tooling";$h=Join-Path $env:LOCALAPPDATA 'hermes'
+            New-Item -ItemType Directory -Force $t|Out-Null
+            $c=Get-Content settings.example.json -Raw|ConvertFrom-Json
+            $c.embeddingDigest='7907646426070047a77226ac3e684fbbe8410524f7b4a74d02837e43f2146bab'
+            $c.database.host='127.0.0.1';$c.database.port=5433;$c.database.name='agents_student_kb';$c.database.user='agents_student'
+            [IO.File]::WriteAllText("$t\settings.json",($c|ConvertTo-Json -Depth 8))
+            $mc=& $py -B student_tools.py --config "$t\settings.json" model-check | Out-String;"MODEL_CHECK $mc"; if($LASTEXITCODE){throw 'model-check failed'}
+            $dr=& $py -B student_tools.py --config "$t\settings.json" doctor | Out-String;"DOCTOR $dr"; if($LASTEXITCODE){throw 'doctor failed'}
+            $first=& $py -B bootstrap.py --hermes-home $h --settings "$t\settings.json" --index | Out-String;"BOOTSTRAP1 $first"
+            $r=$first|ConvertFrom-Json; if($r.status -eq 'failed' -or $r.index.documentsWritten -lt 1 -or -not $r.changed){throw 'first bootstrap failed'}
+            $s=& $py -B student_tools.py --config "$t\settings.json" search "маяк кораблям" --profile tech --project __skills__ | Out-String;"SEARCH $($s.Substring(0,[Math]::Min(400,$s.Length)))"
+            if(@(($s|ConvertFrom-Json).results).Count -lt 1){throw 'search found nothing'}
+            $second=& $py -B bootstrap.py --hermes-home $h --settings "$t\settings.json" --index | Out-String;"BOOTSTRAP2 $second"
+            $r2=$second|ConvertFrom-Json; if($r2.changed -ne $false -or $r2.changedFiles -ne 0){throw 'repeat bootstrap changed files'}
+            foreach($p in 'tech','copywriter'){foreach($f in 'AGENTS.md','SOUL.md'){$x=Get-Content -Raw (Join-Path $h "profiles\$p\$f");$n=([regex]::Matches($x,'agents-student-tooling:start')).Count;if($n -ne 1){throw "block $p/$f=$n"};if($f -eq 'AGENTS.md' -and $x -notmatch 'Личное правило ученика'){throw 'personal text lost'}}}
+            Get-ChildItem -Recurse -File $t | ForEach-Object { if((Get-Content -Raw $_.FullName) -match 'CANARY-WINDOWS-SECRET'){throw "secret copied into $($_.FullName)"} }
+            'TOOLING_IDEMPOTENT changed=false, blocks intact, no secrets copied'
+          }finally{
+            if(-not $server.HasExited){Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue}
+          }
       # Cyrillic text: PowerShell 7 reads the step as UTF-8; Windows PowerShell 5.1 would
       # read the BOM-less script in cp1252 and break its strings.
       - name: Pinned Whisper model and offline transcription of a short Russian phrase

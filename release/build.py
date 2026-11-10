@@ -55,7 +55,7 @@ def committed_files():
     return {n:git('show','HEAD:'+n) for n in sorted(names)}
 
 
-def build(version,output):
+def build(version,output,qa=False):
     if not re.fullmatch(r'v\d{4}\.\d{2}\.\d{2}\.\d+',version):raise ValueError('Version looks like v2026.11.10.1')
     if git('status','--porcelain').strip():raise ValueError('Commit everything first: the release is built from HEAD')
     commit=git('rev-parse','HEAD').decode().strip()
@@ -74,7 +74,7 @@ def build(version,output):
     header=(ROOT/'release/INSTALL-HEADER.md').read_text(encoding='utf-8')
     for key,value in {'VERSION':version,'ZIP_SHA256':sha,'COMMIT':commit}.items():header=header.replace('{{'+key+'}}',value)
     if '{{' in header:raise ValueError('Unfilled placeholder in INSTALL header')
-    if b'WINDOWS_STATUS' in files['FOR-CODEX.md']:raise ValueError('Set the Windows row in FOR-CODEX.md from the Windows x64 run first')
+    if not qa and b'WINDOWS_STATUS' in files['FOR-CODEX.md']:raise ValueError('Set the Windows row in FOR-CODEX.md from the Windows x64 run first')
     install=(header+files['FOR-CODEX.md'].decode('utf-8')).encode()
     exports={zip_name:payload,'SHA256SUMS':(sha+'  '+zip_name+'\n').encode(),'INSTALL-AGENTS-TOOLS.md':install}
     output=Path(output);output.mkdir(parents=True,exist_ok=True)
@@ -87,6 +87,7 @@ def build(version,output):
 
 if __name__=='__main__':
     p=argparse.ArgumentParser();p.add_argument('--version',required=True);p.add_argument('--output',required=True)
+    p.add_argument('--qa',action='store_true',help='acceptance-VM build while the Windows row is still pending; never published')
     a=p.parse_args()
-    try:print(json.dumps(build(a.version,a.output)))
+    try:print(json.dumps(build(a.version,a.output,a.qa)))
     except ValueError as error:print(str(error),file=sys.stderr);sys.exit(1)

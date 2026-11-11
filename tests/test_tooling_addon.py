@@ -57,7 +57,9 @@ class PureHelpers(unittest.TestCase):
         spec=importlib.util.spec_from_file_location('tooling_bootstrap_browser',ADDON/'bootstrap.py')
         module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
         import yaml
-        cases={'0.23.0':('stamp','hermes-chromium'),'0.21.5':('pyproject','agent-browser'),None:(None,'unknown')}
+        # 0.23.1 (accepted by the agents patch v2026.11.10.4) takes the same 0.23 path.
+        cases={'0.23.0':('stamp','hermes-chromium'),'0.23.1':('stamp','hermes-chromium'),
+               '0.21.5':('pyproject','agent-browser'),None:(None,'unknown')}
         for version,(source,mode) in cases.items():
             with self.subTest(version=version),tempfile.TemporaryDirectory() as tmp:
                 root=Path(tmp).resolve();home=root/'hermes';folder=home/'profiles/tech';folder.mkdir(parents=True)

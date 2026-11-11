@@ -65,6 +65,22 @@ def browser_mode(version):
     return 'hermes-chromium' if (major,minor)>=HERMES_CHROMIUM_FROM else 'agent-browser'
 
 
+def windows_arm64():
+    """Windows only: True on ARM64, also for an x64 Python under emulation (IsWow64Process2)."""
+    if platform.machine().upper() in ('ARM64','AARCH64'):return True
+    try:
+        import ctypes
+        from ctypes import wintypes
+        kernel32=ctypes.WinDLL('kernel32')
+        check=kernel32.IsWow64Process2
+    except (OSError,AttributeError):return False
+    check.argtypes=[wintypes.HANDLE,ctypes.POINTER(wintypes.USHORT),ctypes.POINTER(wintypes.USHORT)];check.restype=wintypes.BOOL
+    kernel32.GetCurrentProcess.restype=wintypes.HANDLE
+    process=wintypes.USHORT();native=wintypes.USHORT()
+    if not check(kernel32.GetCurrentProcess(),ctypes.byref(process),ctypes.byref(native)):return False
+    return native.value==0xAA64
+
+
 def scan(home=None,hermes_home=None):
     home=Path(home) if home is not None else Path.home()
     # Windows: the official Hermes lives in %LOCALAPPDATA%\\hermes (Windows v3); the
@@ -91,7 +107,8 @@ def scan(home=None,hermes_home=None):
         try:packages[name]=importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:packages[name]=None
     shell=home/'InfobizAgents/web-shell'
-    return {'schemaVersion':1,'os':platform.system(),'architecture':platform.machine(),
+    extra={'windowsArm64':windows_arm64()} if platform.system()=='Windows' else {}
+    return {**extra,'schemaVersion':1,'os':platform.system(),'architecture':platform.machine(),
             'freeDiskBytes':shutil.disk_usage(home).free,'profiles':profiles,
             'hermesVersion':version,'browserMode':browser_mode(version),'hermesMcpClient':mcp_client,
             'commands':{name:shutil.which(name) for name in COMMANDS},
@@ -106,4 +123,5 @@ def scan(home=None,hermes_home=None):
 
 if __name__=='__main__':
     p=argparse.ArgumentParser();p.add_argument('--hermes-home',type=Path)
-    a=p.parse_args();print(json.dumps(scan(hermes_home=a.hermes_home),ensure_ascii=False,indent=2))
+    # Windows: ASCII JSON, so no console code page can break it.
+    a=p.parse_args();print(json.dumps(scan(hermes_home=a.hermes_home),ensure_ascii=platform.system()=='Windows',indent=2))

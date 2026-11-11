@@ -19,9 +19,12 @@ Codex получает пакет с закреплённым SHA-256, пров�
 - inventory.py — обнаружение ОС, версии Hermes, команд и профилей, без чтения авторизации;
 - bootstrap.py — автоматическая регистрация полученных скиллов/справок/контекста,
   добавление MCP и первое индексирование без замены других подключений;
-- student_tools.py — локальные embeddings, PostgreSQL/pgvector, гибридный поиск,
-  stdio MCP, индексатор/watch, offline Whisper consumer и Bitwarden consumer;
+- student_tools.py — локальные embeddings, PostgreSQL/pgvector (Mac/Ubuntu) или файл
+  SQLite с bge-m3 через ONNX внутри процесса (Windows x64, backend `file`, без служб),
+  гибридный поиск, stdio MCP, индексатор/watch (на Windows — задача планировщика),
+  offline Whisper consumer и Bitwarden consumer;
 - schema.sql — основа новой собственной базы с vector(1024), не дамп чужой БД;
+- settings.example.json (Mac/Ubuntu) и settings.windows.example.json (Windows x64);
 - requirements*.lock — закреплённые зависимости с хешами;
 - browser-smoke.py — отдельный headless профиль и синтетическая страница: на Hermes 0.23+
   через собственный Chromium Hermes, на старых версиях через agent-browser;
@@ -40,13 +43,21 @@ Telegram Reader исключён и не переавторизуется. Па�
 изменений (`changed: false`), что секреты и сессии не открываются и не копируются,
 и что в публичном пакете нет личных данных. Флаг `--postgres` поднимает отдельный
 временный PostgreSQL cluster с pgvector; рабочие БД не использует.
+Windows x64 (backend `file`) проверяется workflow `windows-tooling.yml` на GitHub
+`windows-2025`: это Windows Server, раннер-администратор, синтетические профили, Python 3.12,
+папка ученика с пробелом и кириллицей. Не проверены: Windows 10/11 Home, настоящий профиль
+ученика, Windows ARM, браузер Hermes на Windows.
+`tests/test_file_backend.py` проверяет backend `file` с подставным эмбеддером; с
+`AGENTS_TOOLING_ONNX_MODEL=<папка onnx/ закреплённой модели>` — ещё и с настоящей bge-m3
+(русский поиск, MCP stdio).
 
 Порядок для ученика: сначала патч агентов v2026.11.10.3 (или новее) и штатное обновление
-(Hermes 0.23.0), затем это дооснащение. Hermes 0.21–0.22 код понимает: в 0.23 нет
+(Hermes 0.23.0; 0.23.1 из патча v2026.11.10.4 код принимает так же), затем это дооснащение. Hermes 0.21–0.22 код понимает: в 0.23 нет
 agent-browser, браузер — собственный Chromium Hermes (`hermes pm install chromium`),
 постоянный профиль — `browser.user_data_dir`.
 
 Закреплено: Systran/faster-whisper-small `536b0662…` (SHA-256 каждого файла),
-Ollama bge-m3 digest `79076464…`. Таблица поддержки ОС — в FOR-CODEX.md, раздел 0.
-Windows (x64 и ARM64) в этом выпуске не поддерживается. Релиз собирается `release/build.py` из
+Ollama bge-m3 digest `79076464…`, ONNX-экспорт BAAI/bge-m3 `5617a9f6…` (SHA-256 каждого
+файла). Таблица поддержки ОС — в FOR-CODEX.md, раздел 0; Windows x64 — раздел 10,
+Windows ARM64 не поддерживается. Релиз собирается `release/build.py` из
 закоммиченного дерева (ZIP + manifest + SHA256SUMS + INSTALL-AGENTS-TOOLS.md).

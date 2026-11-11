@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "backend": "file",
+  "kbFile": "C:\\Users\\USER\\InfobizAgents\\tooling\\kb\\agents-student-kb.sqlite",
+  "embeddingModel": "bge-m3",
+  "embeddingDimensions": 1024,
+  "embeddingModelDir": "C:\\Users\\USER\\InfobizAgents\\tooling\\models\\bge-m3-onnx",
+  "embeddingRevision": "5617a9f61b028005a4858fdac845db406aefb181",
+  "roots": [],
+  "secretMap": {}
+}

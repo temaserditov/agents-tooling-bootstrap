@@ -1,4 +1,10 @@
 -- Compatible core of the owner's Team KB. Run ONLY inside the student's new DB.
+-- Refuses any other database: run as the local DB administrator, never as agents_student.
+DO $guard$ BEGIN
+  IF current_database()<>'agents_student_kb' THEN
+    RAISE EXCEPTION 'schema.sql only runs in agents_student_kb, not in %', current_database();
+  END IF;
+END $guard$;
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE TABLE IF NOT EXISTS team_kb_documents (
     id BIGSERIAL PRIMARY KEY,

@@ -48,7 +48,7 @@ Telegram Reader исключён: не устанавливай/не переа�
 | macOS 14–15, Apple Silicon | поддерживается; проверено в виртуальной машине (macOS 15) |
 | Ubuntu 24.04 VPS, x86_64/arm64 | поддерживается; проверено в виртуальной машине (Ubuntu 24.04) |
 | macOS на Intel | код тот же, отдельно не проверялся |
-| Windows 10/11 x64 (официальный Hermes, Windows v3) | поддерживается по разделу 10 (база знаний — файл SQLite + bge-m3 через ONNX, без служб); проверено на GitHub windows-2025 (Windows Server, синтетические профили): модель, индекс, русский поиск, MCP, задача планировщика, Whisper без сети, bws; браузер не проверен |
+| Windows 10/11 x64 (официальный Hermes, Windows v3) | поддерживается по разделу 10 (база знаний — файл SQLite + bge-m3 через ONNX, без служб); проверено на GitHub windows-2025 (Windows Server, синтетические профили): модель, индекс, русский поиск, MCP, задача планировщика, Whisper без сети, bws, headless-браузер |
 | Windows на ARM64 | НЕ поддерживается: ничего не ставь, скажи мне |
 | Windows → VPS | всё ставится на Ubuntu VPS, не на Windows клиента |
 
@@ -372,7 +372,8 @@ browser_* инструменты из Hermes удалены, единствен�
 `user_data_dir` = `<профиль>/browser-profile-tooling`. Не включай
 `use_real_profile` и не указывай `cdp_url` на браузер пользователя.
 Smoke: `PYTHON browser-smoke.py --hermes-python HERMES_PYTHON --hermes-home ПРОФИЛЬ`,
-где HERMES_PYTHON — `~/.hermes/hermes-agent/venv/bin/python` (browser-smoke.py
+где HERMES_PYTHON — поле `hermesPython` из inventory.py (на Mac/Ubuntu обычно
+`~/.hermes/hermes-agent/venv/bin/python`; browser-smoke.py
 работает и на Python 3.9, но запускай его этим Python Hermes). Hermes сам находит Chromium и строит команду
 запуска по своим правилам; тест подменяет только стартовую страницу.
 
@@ -492,8 +493,8 @@ Windows Server, пользователь раннера — администра
 В этом CI прошли: загрузка модели с проверкой SHA-256, индекс, русский поиск, реальный MCP-вызов
 `agent_kb_search` (напрямую и через vault-mcp, с выгрузкой модели между вызовами), задача
 планировщика (планировщик сам запустил её, `status: ok`), Whisper и поиск при доказанно
-заблокированной сети, `bws --version` 2.1.0, отсутствие секрета-приманки в индексе и логах.
-Браузер не проверен. Говори мне об этом честно и не называй установку проверенной сверх этого.
+заблокированной сети, `bws --version` 2.1.0, headless-браузер Hermes (Chromium, отдельный
+профиль), отсутствие секрета-приманки в индексе и логах. Говори мне об этом честно и не называй установку проверенной сверх этого.
 
 **Место и память.** Модель bge-m3 (ONNX) — 2,3 ГБ (2 284 млн байт: `model.onnx_data`
 2 266 820 608 байт и мелкие файлы), Whisper small — около 0,5 ГБ, venv — около 0,5 ГБ, плюс
@@ -621,14 +622,13 @@ Mac/Ubuntu, в Windows нет) и возвращает его код выход�
 
 **Браузер.** Hermes 0.23 на Windows: `hermes pm install chromium`, затем
 `HERMES_PYTHON -B browser-smoke.py --hermes-python HERMES_PYTHON --hermes-home "$env:LOCALAPPDATA\hermes\profiles\ПРОФИЛЬ"`.
-HERMES_PYTHON — Python, которым работает сам Hermes. На Windows он НЕ лежит в
-`%LOCALAPPDATA%\hermes\hermes-agent\venv` (в CI этой папки нет): найди его по inventory
-(раздел 1) или среди `python.exe` внутри `%LOCALAPPDATA%\hermes`, у которого импортируется
-пакет Hermes. Отдельный `tools\python-*` без пакетов Hermes — не он. Если однозначно не
-нашёл — не угадывай. **Браузер на Windows этим выпуском НЕ проверен** (шаг CI до него не
-дошёл): если smoke не проходит или HERMES_PYTHON не найден, честно напиши мне «браузер на
-Windows не проверен», не обходи это видимым окном или моим Chrome/Edge. База знаний,
-Whisper и Bitwarden от браузера не зависят.
+HERMES_PYTHON — Python, которым работает сам Hermes: возьми его из поля `hermesPython`
+вывода inventory.py (раздел 1). На Windows он лежит не в `hermes-agent\venv`, а в хранилище
+Hermes (`%LOCALAPPDATA%\hermes\installs\...\venv\Scripts\python.exe`); inventory находит его
+сам — не угадывай путь. Если `hermesPython` пустой — скажи мне «браузер на Windows не
+проверен» и не обходи это видимым окном или моим Chrome/Edge. Проверено в CI: headless,
+отдельный профиль, синтетическая страница прочитана. База знаний, Whisper и Bitwarden от
+браузера не зависят.
 
 **Файловые инструменты (раздел 2) на Windows этим выпуском не проверялись.** Используй уже
 установленные; недостающие — только официальные пакеты через winget и с моего согласия, и

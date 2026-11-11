@@ -307,22 +307,26 @@ jobs:
           $asr=Get-Content -Raw -Encoding UTF8 "$env:RUNNER_TEMP\asr.json"|ConvertFrom-Json
           $text=($asr.segments|%{$_.text}) -join ' ';"ASR language=$($asr.language) text=$text"
           if($asr.language -ne 'ru' -or $text -notmatch '(?i)распознав' -or $text -notmatch '(?i)интернет'){throw 'unexpected transcript'}
-      # Informational: the Windows browser path of Hermes 0.23 is not a pass criterion of
-      # this run. Its result decides what FOR-CODEX says about the browser on Windows.
-      - name: Hermes Chromium headless smoke (informational)
+      - name: Hermes Chromium headless smoke (Hermes interpreter found by inventory)
         # Independent of the step before: a failure there must not hide this one's result.
         if: ${{ !cancelled() }}
-        continue-on-error: true
         shell: pwsh
         timeout-minutes: 15
         run: |
           $ErrorActionPreference='Stop'
-          $u=Join-Path $env:RUNNER_TEMP $env:STUDENT_DIR_NAME;$t="$u\tooling"
+          [Console]::OutputEncoding=[Text.Encoding]::UTF8;$OutputEncoding=[Text.Encoding]::UTF8
+          $u=Join-Path $env:RUNNER_TEMP $env:STUDENT_DIR_NAME;$t="$u\tooling";$py="$u\venv\Scripts\python.exe";$logs="$env:RUNNER_TEMP\ci-logs"
           Set-Location -LiteralPath $t
           $hermes=Join-Path $env:LOCALAPPDATA 'hermes\bin\hermes.exe'
           if(-not (Test-Path -LiteralPath $hermes)){$hermes=(Get-Command hermes -ErrorAction Stop).Source}
-          $hpy=Join-Path $env:LOCALAPPDATA 'hermes\hermes-agent\venv\Scripts\python.exe'
-          if(-not (Test-Path -LiteralPath $hpy)){throw "Hermes python not found at $hpy"}
+          # The interpreter Hermes runs on is whatever imports hermes_cli: the official Windows
+          # installer does not keep it in hermes-agent\venv. inventory finds it the same way for students.
+          $inv=& $py -B inventory.py | Out-String;$inv|Set-Content -LiteralPath "$logs\inventory-browser.txt" -Encoding UTF8
+          $hpy=($inv|ConvertFrom-Json).hermesPython;"HERMES_PYTHON $hpy mcpClient=$(($inv|ConvertFrom-Json).hermesMcpClient)"
+          if(-not $hpy){
+            Get-ChildItem -LiteralPath (Join-Path $env:LOCALAPPDATA 'hermes') -Recurse -Filter python.exe -File -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch '\\(cache|node_modules)\\' } | ForEach-Object { "CANDIDATE $($_.FullName)" }
+            throw 'inventory did not find the Hermes interpreter'
+          }
           & $hermes pm install chromium; if($LASTEXITCODE){throw 'hermes pm install chromium failed'}
           $out=& $hpy -B browser-smoke.py --hermes-python $hpy --hermes-home (Join-Path $env:LOCALAPPDATA 'hermes\profiles\tech') | Out-String;"BROWSER_SMOKE $out"
           if($LASTEXITCODE){throw 'browser smoke failed'}

@@ -92,8 +92,27 @@ class PureHelpers(unittest.TestCase):
             self.assertIsNone(module.hermes_mcp_client(home))
             # 0.23: no venv/lib at all, packages live in the PM store behind this launcher.
             for code,expected in ((0,True),(3,False),(1,None)):
-                launcher.write_text('#!/bin/sh\nexit %d\n'%code);launcher.chmod(0o755)
+                # The Hermes interpreter imports hermes_cli; the mcp probe answers with `code`.
+                launcher.write_text('#!/bin/sh\ncase "$*" in *hermes_cli*) exit 0;; esac\nexit %d\n'%code);launcher.chmod(0o755)
                 self.assertIs(module.hermes_mcp_client(home),expected)
+
+    @unittest.skipIf(os.name=='nt','POSIX launcher fixture')
+    def test_windows_hermes_interpreter_is_found_outside_hermes_agent_venv(self):
+        # Official Windows installer: no hermes-agent\venv; find the python.exe that imports
+        # hermes_cli, not a bare tools\python-* and nothing under cache or profiles.
+        spec=importlib.util.spec_from_file_location('tooling_inventory_winpy',ADDON/'inventory.py')
+        module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp).resolve()/'hermes'
+            def fake(rel,hermes):
+                path=root/rel;path.parent.mkdir(parents=True,exist_ok=True)
+                path.write_text('#!/bin/sh\nexit %d\n'%(0 if hermes else 1));path.chmod(0o755);return path
+            fake('tools/python-3.14.9/python.exe',False)
+            fake('cache/uv/python.exe',True);fake('profiles/tech/python.exe',True)
+            self.assertIsNone(module.hermes_python(root,windows=True))
+            real=fake('installs/abc/environments/main/Scripts/python.exe',True)
+            self.assertEqual(module.hermes_python(root,windows=True),real)
+            self.assertIsNone(module.hermes_python(root,windows=False))
 
     def test_unreadable_instruction_file_is_skipped_not_fatal(self):
         spec=importlib.util.spec_from_file_location('tooling_bootstrap_bytes',ADDON/'bootstrap.py')

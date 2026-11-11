@@ -46,7 +46,7 @@ Telegram Reader исключён и не переавторизуется. Па�
 Windows x64 (backend `file`) проверяется workflow `windows-tooling.yml` на GitHub
 `windows-2025`: это Windows Server, раннер-администратор, синтетические профили, Python 3.12,
 папка ученика с пробелом и кириллицей. Не проверены: Windows 10/11 Home, настоящий профиль
-ученика, Windows ARM, браузер Hermes на Windows.
+ученика, Windows ARM.
 `tests/test_file_backend.py` проверяет backend `file` с подставным эмбеддером; с
 `AGENTS_TOOLING_ONNX_MODEL=<папка onnx/ закреплённой модели>` — ещё и с настоящей bge-m3
 (русский поиск, MCP stdio).

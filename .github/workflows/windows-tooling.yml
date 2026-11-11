@@ -209,7 +209,13 @@ jobs:
             $def=[xml](Export-ScheduledTask -TaskName $task)
             $exec=$def.Task.Actions.Exec;$cmd=[string]$exec.Command;$arguments=[string]$exec.Arguments
             "TASK command=$cmd arguments=$arguments"
-            if([string]$def.Task.Triggers.TimeTrigger.Repetition.Interval -ne 'PT5M' -or [string]$def.Task.Principals.Principal.RunLevel -ne 'LeastPrivilege' -or [string]$def.Task.Settings.MultipleInstancesPolicy -ne 'IgnoreNew'){throw 'unexpected task definition'}
+            $def.OuterXml|Set-Content -LiteralPath "$logs\task-definition.xml" -Encoding UTF8
+            # The exported XML may leave out default values (RunLevel, MultipleInstancesPolicy):
+            # read the settings as the scheduler resolved them.
+            $st=Get-ScheduledTask -TaskName $task
+            $interval=[string]$st.Triggers[0].Repetition.Interval;$level=[string]$st.Principal.RunLevel;$logon=[string]$st.Principal.LogonType;$multi=[string]$st.Settings.MultipleInstances
+            "TASK_SETTINGS interval=$interval runLevel=$level logonType=$logon multipleInstances=$multi"
+            if($interval -ne 'PT5M' -or $level -ne 'Limited' -or $logon -ne 'Interactive' -or $multi -ne 'IgnoreNew'){throw 'unexpected task definition'}
             if($cmd -ne "$u\venv\Scripts\pythonw.exe" -or $arguments -notmatch [regex]::Escape('"'+$s+'"') -or $arguments -notmatch ' index --status-file '){throw 'task command or quoting is wrong'}
             if(Test-Path -LiteralPath $status){Remove-Item -LiteralPath $status}
             & schtasks.exe /Run /TN $task | Out-Null
@@ -240,6 +246,8 @@ jobs:
       # Cyrillic text: PowerShell 7 reads the step as UTF-8; Windows PowerShell 5.1 would
       # read the BOM-less script in cp1252 and break its strings.
       - name: Pinned Whisper model; network block proven; offline transcription and KB search
+        # Independent of the step before: a failure there must not hide this one's result.
+        if: ${{ !cancelled() }}
         shell: pwsh
         timeout-minutes: 20
         run: |
@@ -302,6 +310,8 @@ jobs:
       # Informational: the Windows browser path of Hermes 0.23 is not a pass criterion of
       # this run. Its result decides what FOR-CODEX says about the browser on Windows.
       - name: Hermes Chromium headless smoke (informational)
+        # Independent of the step before: a failure there must not hide this one's result.
+        if: ${{ !cancelled() }}
         continue-on-error: true
         shell: pwsh
         timeout-minutes: 15
@@ -317,6 +327,8 @@ jobs:
           $out=& $hpy -B browser-smoke.py --hermes-python $hpy --hermes-home (Join-Path $env:LOCALAPPDATA 'hermes\profiles\tech') | Out-String;"BROWSER_SMOKE $out"
           if($LASTEXITCODE){throw 'browser smoke failed'}
       - name: Bitwarden Secrets Manager CLI (pinned official release, SHA-256)
+        # Independent of the step before: a failure there must not hide this one's result.
+        if: ${{ !cancelled() }}
         shell: powershell
         run: |
           $ErrorActionPreference='Stop'
@@ -331,6 +343,8 @@ jobs:
           $version=(& $exe[0].FullName --version 2>&1|Out-String).Trim();"BWS $version"
           if($version -notmatch [regex]::Escape($env:BWS_VERSION)){throw 'unexpected bws version'}
       - name: No secret in the index (with -wal/-shm), the status file, the logs or the instructions
+        # Independent of the step before: a failure there must not hide this one's result.
+        if: ${{ !cancelled() }}
         shell: pwsh
         run: |
           $ErrorActionPreference='Stop'

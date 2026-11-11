@@ -484,6 +484,13 @@ WSL, Docker и не создавай службы Windows. Оболочка, в 
 выполняются; их заменяют шаги ниже. Остальные правила разделов 1–9 (сохранность, секреты,
 профили, браузер, приёмка) действуют.
 
+**Что именно проверено.** Этот путь прогоняется в GitHub Actions на `windows-2025` — это
+Windows Server, пользователь раннера — администратор, профили агентов синтетические
+(официальный Hermes 0.23.0 без установщика курса), Python 3.12, папка ученика с пробелом и
+кириллицей в пути (`Папка ученика`). НЕ проверялись: Windows 10/11 Home и Pro, настоящий
+профиль ученика после установщика курса, запуск без прав администратора, Windows ARM.
+Говори мне об этом честно и не называй установку проверенной сверх этого.
+
 **Место и память.** Модель bge-m3 (ONNX) — 2,3 ГБ (2 284 млн байт: `model.onnx_data`
 2 266 820 608 байт и мелкие файлы), Whisper small — около 0,5 ГБ, venv — около 0,5 ГБ, плюс
 сам Python и индекс (текст материалов и 4 КБ на каждый фрагмент). Итого без индекса —
@@ -498,7 +505,13 @@ WSL, Docker и не создавай службы Windows. Оболочка, в 
 `%LOCALAPPDATA%\hermes` (inventory находит его сам). Рабочая папка пакета —
 `%USERPROFILE%\InfobizAgents\tooling` (дальше `TOOLING`), пакет распакуй в неё по шапке
 задания. Нужен официальный Python 3.11–3.13 x64 с python.org (в нём есть SQLite с FTS5 и
-`pythonw.exe`); Python из Microsoft Store и MSYS не используй.
+`pythonw.exe`; в CI проверялся 3.12); Python из Microsoft Store и MSYS не используй.
+
+На Windows ARM64 (в том числе x64-Python под эмуляцией) команды пакета отвечают
+«Windows ARM пока не поддерживается: только диагностика» и ничего не делают: остановись и
+скажи мне. Длинные пути: если в материалах есть пути длиннее 260 символов, индекс их
+пропускает и считает (`skippedReasons.tooLong`); включать `LongPathsEnabled` в реестре не
+обязательно — это системная настройка, только с моего согласия и от администратора.
 
 ```powershell
 py -3.12 -m venv TOOLING\venv
@@ -539,13 +552,18 @@ fetch-embedding-model качает только из `huggingface.co/BAAI/bge-m3
 
 ```powershell
 PY -B bootstrap.py --hermes-home $env:LOCALAPPDATA\hermes --settings SETTINGS --inspect
-PY -B bootstrap.py --hermes-home $env:LOCALAPPDATA\hermes --settings SETTINGS --index
+PY -B bootstrap.py --hermes-home $env:LOCALAPPDATA\hermes --settings SETTINGS
+PY -B student_tools.py --config SETTINGS index --status-file TOOLING\index-status.json --progress
 PY -B student_tools.py --config SETTINGS search "запрос по-русски" --profile tech --project __skills__
 PY -B bootstrap.py --hermes-home $env:LOCALAPPDATA\hermes --settings SETTINGS --index
 ```
 
 bootstrap сам создаёт схему базы в `kbFile` (`kbSchemaCreated: true`); psql, schema.sql и
-grants.sql на Windows не нужны. Регистрация MCP в config.yaml каждого профиля и блок
+grants.sql на Windows не нужны. Первую индексацию всех материалов запускай ПРЯМО в
+терминале, на переднем плане, командой `index --status-file ... --progress`: она печатает
+строку на каждый проиндексированный документ, и я вижу ход работы (на CPU это может занять
+часы — не прерывай, пока растёт `documentsWritten`). Задачу планировщика (10.4) включай
+только после неё. Последний bootstrap с `--index` должен ничего не переиндексировать. Регистрация MCP в config.yaml каждого профиля и блок
 `agents-student-tooling` в AGENTS.md/SOUL.md — как в разделе 4. Повторный запуск должен
 дать `"changed": false` и `changedFiles: 0`. MCP-клиент Hermes — как в разделе 4: при
 `hermesMcpClient: false` выполни `hermes pm install --extra mcp`, затем для каждого профиля
@@ -560,12 +578,13 @@ grants.sql на Windows не нужны. Регистрация MCP в config.ya
 ```powershell
 PY -B student_tools.py --config SETTINGS schedule-index --interval-minutes 5
 PY -B student_tools.py --config SETTINGS schedule-index --interval-minutes 5
-schtasks /Query /TN AgentsTooling-KB-Index
-schtasks /Run /TN AgentsTooling-KB-Index
+schtasks /Query /TN ИМЯ_ЗАДАЧИ
+schtasks /Run /TN ИМЯ_ЗАДАЧИ
 Get-Content TOOLING\index-status.json
 ```
 
-Задача `AgentsTooling-KB-Index` запускает `pythonw.exe` (без окна) с
+ИМЯ_ЗАДАЧИ — поле `task` из ответа schedule-index: `AgentsTooling-KB-Index-<мой пользователь>`
+(у каждого пользователя Windows своя задача). Она запускает `pythonw.exe` (без окна) с
 `student_tools.py --config SETTINGS index --status-file TOOLING\index-status.json` раз в
 N минут (N от 1 до 1440, по умолчанию 5), только пока я вошёл в систему, без повышенных
 прав; новый запуск не стартует, пока идёт прошлый, а второй `index` при работающем первом
@@ -584,8 +603,13 @@ N минут (N от 1 до 1440, по умолчанию 5), только по�
 `https://github.com/bitwarden/sdk-sm/releases/download/bws-v2.1.0/bws-x86_64-pc-windows-msvc-2.1.0.zip`,
 SHA-256 `8d6f2b51beb6f992b5b1de8b85a98bdf18de74096b724d17fa06219fc23f2bd5` (сверь до
 распаковки; при несовпадении — СТОП). Распакуй в `TOOLING\bin\bws` и добавь эту папку в PATH
-моего пользователя (не системный), чтобы `bws` находил vault-run/vault-mcp. Проверка:
-`bws --version` показывает 2.1.0. Дальше — раздел 3 без изменений. На Windows vault-mcp
+моего пользователя (не системный), чтобы `bws` находил vault-run/vault-mcp. Новый PATH видят
+только НОВЫЕ окна терминала и заново запущенный Hermes: открой новое окно, прежде чем
+проверять. Проверка: `bws --version` показывает 2.1.0. Дальше — раздел 3 без изменений.
+`BWS_ACCESS_TOKEN` никогда не записывай через `setx`, в переменные среды пользователя или
+системы, в файлы и задачи планировщика: токен вводится только скрыто в интерактивном
+терминале при запуске (раздел 3). На Windows родительский процесс vault-run/vault-mcp,
+который ждёт дочерний, сразу убирает токен из своего окружения. На Windows vault-mcp
 запускает MCP-сервер дочерним процессом на тех же stdin/stdout (замены процесса, как на
 Mac/Ubuntu, в Windows нет) и возвращает его код выхода. Проверено в CI: загрузка, SHA-256 и
 `bws --version`; получение настоящего секрета из моего проекта на Windows не проверялось —
@@ -612,8 +636,8 @@ Mac/Ubuntu, в Windows нет) и возвращает его код выход�
    его из активной выдачи; соседний проект с тем же словом не попадает в результат.
 4. Агент вызывает MCP `agent_kb_search`, не просто видит подключение.
 5. Повторный bootstrap — `changed: false`, `changedFiles: 0`.
-6. Задача `AgentsTooling-KB-Index` есть, ручной `schtasks /Run` обновил `index-status.json`
-   со `status: ok`; постоянных процессов и служб базы знаний нет.
+6. Задача `AgentsTooling-KB-Index-<пользователь>` есть, ручной `schtasks /Run` обновил
+   `index-status.json` со `status: ok`; постоянных процессов и служб базы знаний нет.
 7. Whisper без сети дал текст; `bws --version` — 2.1.0; браузер — по 10.5.
 8. Ни один секрет не попал в TOOLING, в файл базы и в инструкции профилей.
 

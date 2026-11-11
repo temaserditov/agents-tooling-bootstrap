@@ -64,7 +64,9 @@ class FileIndexAndSearch(unittest.TestCase):
 
     def test_index_search_repeat_update_revert_and_archive(self):
         self.assertTrue(tools.ensure_kb_schema(self.cfg));self.assertFalse(tools.ensure_kb_schema(self.cfg))
-        self.assertEqual(tools.index(self.cfg)['documentsWritten'],3)
+        if os.name!='nt':self.assertEqual(os.stat(self.cfg['kbFile']).st_mode&0o777,0o600)
+        first=tools.index(self.cfg)
+        self.assertEqual(first['documentsWritten'],3);self.assertEqual(first['skippedReasons'],{})
         again=tools.index(self.cfg);self.assertEqual(again['documentsWritten'],0);self.assertEqual(again['unchanged'],3)
         result=tools.search(self.cfg,'маяк кораблям','tech','a')
         # Same response shape as the PostgreSQL backend.
@@ -77,7 +79,9 @@ class FileIndexAndSearch(unittest.TestCase):
         self.assertEqual(tools.index(self.cfg)['documentsWritten'],1)
         self.assertIn('amended',tools.search(self.cfg,'маяк','tech','a')['results'][0]['content'])
         (self.a/'lighthouse.md').write_text('маяк светит кораблям ночью',encoding='utf-8')
+        calls=self.embed.target.embed.call_count
         self.assertEqual(tools.index(self.cfg)['documentsWritten'],1)  # the old record is active again
+        self.assertEqual(self.embed.target.embed.call_count,calls)  # ... with its stored vectors, not re-embedded
         self.assertNotIn('amended',json.dumps(tools.search(self.cfg,'маяк','tech','a'),ensure_ascii=False))
         (self.a/'lighthouse.md').unlink()
         tools.index(self.cfg)
@@ -269,9 +273,12 @@ class WindowsProcesses(unittest.TestCase):
             started=[]
             def child(argv,env=None,**kw):
                 started.append((argv,env,kw));return subprocess.CompletedProcess(argv,3)
-            with patch.object(tools,'IS_WINDOWS',True),patch.object(tools,'vault_env',return_value=({'X_API_KEY':'v'},['v'])),\
+            with patch.object(tools,'IS_WINDOWS',True),patch.object(tools,'windows_native_arm64',return_value=False),\
+                 patch.object(tools,'vault_env',return_value=({'X_API_KEY':'v'},['v'])),\
+                 patch.dict(os.environ,{'BWS_ACCESS_TOKEN':'fixture-bootstrap-token'}),\
                  patch.object(tools.subprocess,'run',side_effect=child),patch.object(sys,'argv',['student_tools.py','--config',str(settings),'vault-mcp']):
                 with self.assertRaises(SystemExit) as caught:tools.main()
+                self.assertNotIn('BWS_ACCESS_TOKEN',os.environ)  # the waiting Windows parent keeps no token
             self.assertEqual(caught.exception.code,3)
             argv,env,kw=started[0]
             self.assertEqual(argv[-3:],['--config',str(settings),'mcp']);self.assertEqual(env,{'X_API_KEY':'v'});self.assertEqual(kw,{})
@@ -280,28 +287,33 @@ class WindowsProcesses(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp).resolve();settings=root/'settings.json'
             settings.write_text(json.dumps(file_cfg(root)),encoding='utf-8')
-            with patch.object(tools,'IS_WINDOWS',True),patch.object(sys,'argv',['student_tools.py','--config',str(settings),'watch']),\
+            with patch.object(tools,'IS_WINDOWS',True),patch.object(tools,'windows_native_arm64',return_value=False),\
+                 patch.object(sys,'argv',['student_tools.py','--config',str(settings),'watch']),\
                  patch.object(tools,'index',side_effect=AssertionError('no watch loop')):
                 with self.assertRaises(tools.StudentFacingError) as caught:tools.main()
             self.assertIn('schedule-index',str(caught.exception))
 
     def test_scheduled_task_is_per_user_bounded_and_idempotent(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root=Path(tmp).resolve();settings=root/'tooling/settings.json';settings.parent.mkdir()
+            root=Path(tmp).resolve()/'Папка ученика';settings=root/'tooling/settings.json';settings.parent.mkdir(parents=True)
             settings.write_text('{}',encoding='utf-8');pythonw=root/'venv/Scripts/pythonw.exe';pythonw.parent.mkdir(parents=True);pythonw.write_bytes(b'')
             registered={};calls=[]
             def schtasks(args,**kw):
-                calls.append(args)
+                calls.append(args);self.assertIs(kw.get('stdin'),subprocess.DEVNULL)
                 if args[1]=='/Query':return subprocess.CompletedProcess(args,0 if registered else 1)
                 if args[1]=='/Create':registered['xml']=Path(args[args.index('/XML')+1]).read_bytes().decode('utf-16');return subprocess.CompletedProcess(args,0)
+                if args[1]=='/End':return subprocess.CompletedProcess(args,1)  # not running: fine
                 if args[1]=='/Delete':registered.clear();return subprocess.CompletedProcess(args,0)
             with patch.dict(os.environ,{'USERNAME':'student','USERDOMAIN':'PC'}):
                 first=tools.schedule_index(settings,5,python=pythonw,run=schtasks,windows=True)
-                self.assertTrue(first['changed']);xml=registered['xml']
+                self.assertTrue(first['changed']);self.assertEqual(first['task'],'AgentsTooling-KB-Index-student')
+                xml=registered['xml']
                 self.assertIn('<Interval>PT5M</Interval>',xml);self.assertIn('<RunLevel>LeastPrivilege</RunLevel>',xml)
-                self.assertIn('<LogonType>InteractiveToken</LogonType>',xml);self.assertIn('<UserId>PC\\student</UserId>',xml)
+                self.assertIn('<LogonType>InteractiveToken</LogonType>',xml);self.assertNotIn('UserId',xml)
                 self.assertIn('IgnoreNew',xml);self.assertIn(str(pythonw),xml);self.assertIn(' index --status-file ',xml)
                 self.assertNotIn('watch',xml)
+                # Paths with a space are quoted the way pythonw parses its command line.
+                self.assertIn('"'+str(root/'tooling/settings.json')+'"',xml)
                 creates=sum(c[1]=='/Create' for c in calls)
                 self.assertIs(tools.schedule_index(settings,5,python=pythonw,run=schtasks,windows=True)['changed'],False)
                 self.assertEqual(sum(c[1]=='/Create' for c in calls),creates)
@@ -311,8 +323,115 @@ class WindowsProcesses(unittest.TestCase):
                 for bad in (0,-1,2000):
                     with self.assertRaises(tools.StudentFacingError):tools.schedule_index(settings,bad,python=pythonw,run=schtasks,windows=True)
                 with self.assertRaises(tools.StudentFacingError):tools.schedule_index(settings,5,python=pythonw,run=schtasks,windows=False)
+                calls.clear()
                 self.assertTrue(tools.unschedule_index(settings,run=schtasks,windows=True)['changed'])
+                self.assertEqual([c[1] for c in calls],['/Query','/End','/Delete'])  # a running index is ended first
                 self.assertIs(tools.unschedule_index(settings,run=schtasks,windows=True)['changed'],False)
+
+    def test_task_name_is_per_user_and_ascii(self):
+        self.assertEqual(tools.index_task_name('student'),'AgentsTooling-KB-Index-student')
+        cyr=tools.index_task_name('Иван Петров');other=tools.index_task_name('Пётр Иванов')
+        self.assertTrue(cyr.isascii() and other.isascii());self.assertNotEqual(cyr,other)
+        self.assertRegex(tools.index_task_name('a.b c'),r'^AgentsTooling-KB-Index-a_b_c-[0-9a-f]{8}$')
+
+    def test_windows_arm64_is_refused_before_any_work(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp).resolve();settings=root/'settings.json';settings.write_text(json.dumps(file_cfg(root)),encoding='utf-8')
+            with patch.object(tools,'IS_WINDOWS',True),patch.object(tools,'windows_native_arm64',return_value=True),\
+                 patch.object(tools,'config',side_effect=AssertionError('no work on ARM')),\
+                 patch.object(sys,'argv',['student_tools.py','--config',str(settings),'doctor']):
+                with self.assertRaises(tools.StudentFacingError) as caught:tools.main()
+            self.assertEqual(str(caught.exception),'Windows ARM пока не поддерживается: только диагностика')
+        self.assertFalse(tools.windows_native_arm64())  # never ARM-refused outside Windows
+
+    def test_windows_json_output_is_ascii(self):
+        value={'message':'маяк 🚢'}
+        with patch.object(tools,'IS_WINDOWS',True):
+            text=tools.dump_json(value,ensure_ascii=False);self.assertTrue(text.isascii());self.assertEqual(json.loads(text),value)
+        with patch.object(tools,'IS_WINDOWS',False):
+            self.assertEqual(tools.dump_json(value,ensure_ascii=False),json.dumps(value,ensure_ascii=False))  # Mac/Ubuntu as before
+
+
+class WindowsMcpServer(unittest.TestCase):
+    """The deadlock fix: on Windows (backend file) native libraries load before stdin is read,
+    and the server reads a private duplicate of the pipe while the std handle is NUL."""
+    def run_serve(self,windows,backend):
+        order=[]
+        with patch.object(tools,'IS_WINDOWS',windows),\
+             patch.object(tools,'preload_native_libraries',side_effect=lambda:order.append('preload')),\
+             patch.object(tools,'detach_std_input',side_effect=lambda:order.append('detach') or 'private-stdin'),\
+             patch.object(tools,'run_stdio',side_effect=lambda server,stdin:order.append(('run_stdio',stdin))),\
+             patch('mcp.server.fastmcp.FastMCP.run',side_effect=lambda transport:order.append(('fastmcp',transport))):
+            tools.serve({'backend':backend})
+        return order
+
+    def test_windows_file_backend_preloads_and_swaps_stdin(self):
+        self.assertEqual(self.run_serve(True,'file'),['preload','detach',('run_stdio','private-stdin')])
+
+    def test_posix_and_postgres_keep_the_plain_stdio_server(self):
+        self.assertEqual(self.run_serve(False,'file'),[('fastmcp','stdio')])
+        self.assertEqual(self.run_serve(False,'postgres'),[('fastmcp','stdio')])
+
+    def test_qa_keep_alive_needs_the_other_qa_knobs(self):
+        with patch.dict(os.environ,{'AGENTS_TOOLING_QA_KEEPALIVE_SECONDS':'3'}):
+            os.environ.pop('AGENTS_TOOLING_QA_MAX_FILES',None);self.assertIsNone(tools.qa_keep_alive())
+            os.environ['AGENTS_TOOLING_QA_MAX_FILES']='3';self.assertEqual(tools.qa_keep_alive(),3)
+            self.run_serve(False,'file');self.assertEqual(tools._ENGINE['keepAlive'],3)
+        tools._ENGINE['keepAlive']=None
+
+    def test_the_low_level_stdio_path_matches_the_installed_mcp(self):
+        import inspect
+        from mcp.server.fastmcp import FastMCP
+        from mcp.server.stdio import stdio_server
+        self.assertEqual(list(inspect.signature(stdio_server).parameters),['stdin','stdout'])
+        server=FastMCP('x');self.assertTrue(callable(server._mcp_server.run));self.assertTrue(server._mcp_server.create_initialization_options())
+
+
+class SourceSafety(unittest.TestCase):
+    def test_secret_like_names_are_skipped_in_any_case(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp).resolve()
+            (root/'note.md').write_text('ok',encoding='utf-8')
+            for name in ('AUTH.JSON','Secrets.yaml','secrets.json','server.PEM','id_rsa','.env.local'):(root/name).write_text('x',encoding='utf-8')
+            for folder in ('Secrets','CREDENTIALS','cookies'):(root/folder).mkdir();(root/folder/'leak.md').write_text('x',encoding='utf-8')
+            self.assertEqual([p.name for p in tools.candidates(root)],['note.md'])
+
+    def test_windows_ignores_case_for_every_excluded_name(self):
+        with patch.object(tools,'IS_WINDOWS',True),patch.object(tools.os.path,'normcase',side_effect=str.lower):
+            self.assertTrue(tools.excluded_name('Config.YAML'));self.assertTrue(tools.excluded_name('Logs'))
+        self.assertFalse(tools.excluded_name('Logs'))  # POSIX names keep their case, as before
+
+    def test_reparse_points_are_links_on_windows(self):
+        class St:st_file_attributes=0x400
+        with patch.object(tools,'IS_WINDOWS',True),patch.object(tools.os,'lstat',return_value=St()):
+            self.assertTrue(tools.linked(Path('/x/junction')))
+            with self.assertRaises(ValueError):tools.guard('/x/junction/file')
+
+    def test_an_unreadable_file_is_counted_and_skipped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp).resolve();(root/'good.md').write_text('a',encoding='utf-8');(root/'locked.md').write_text('b',encoding='utf-8')
+            real=Path.stat
+            def stat(self,*a,**kw):
+                if self.name=='locked.md' and not kw.get('follow_symlinks',True) is False:raise PermissionError(13,'denied')
+                return real(self,*a,**kw)
+            problems={}
+            with patch.object(Path,'stat',stat):
+                self.assertEqual([p.name for p in tools.candidates(root,problems)],['good.md'])
+                with self.assertRaises(PermissionError):list(tools.candidates(root))  # Mac/Ubuntu path unchanged
+            self.assertEqual(problems,{'unreadable':1})
+
+
+class SettingsEncodings(unittest.TestCase):
+    def test_utf16_and_bom_settings_are_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp).resolve();cfg=file_cfg(root)
+            for name,data in [('utf16le.json',json.dumps(cfg,ensure_ascii=False).encode('utf-16')),
+                              ('utf16be.json',b'\xfe\xff'+json.dumps(cfg).encode('utf-16-be')),
+                              ('utf8bom.json',b'\xef\xbb\xbf'+json.dumps(cfg).encode()),('utf8.json',json.dumps(cfg).encode())]:
+                with self.subTest(name=name):
+                    (root/name).write_bytes(data);self.assertEqual(tools.config(root/name)['backend'],'file')
+            bootstrap=load('tooling_bootstrap_enc','bootstrap.py')
+            self.assertEqual(json.loads(bootstrap.settings_text(root/'utf16le.json'))['kbFile'],cfg['kbFile'])
 
 
 class FileBootstrap(unittest.TestCase):

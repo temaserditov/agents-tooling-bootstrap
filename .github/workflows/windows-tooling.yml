@@ -4,6 +4,9 @@
 # SQLite file. No PostgreSQL, no Ollama, no service: run 42908480218 showed that a server
 # started in one step is gone in the next one, and a student's Codex shell kills children
 # the same way. Every step below is self-contained; only files carry over between steps.
+# Run 42977531559: the stdio MCP server deadlocked on the first tool call (a DLL loaded
+# during the call queried the std handles while a synchronous read was pending on stdin);
+# fixed in student_tools.serve, checked here with hard timeouts and thread dumps.
 name: Windows tooling x64
 on:
   workflow_dispatch:
@@ -23,9 +26,12 @@ jobs:
       BWS_VERSION: 2.1.0
       BWS_ZIP_SHA256: 8d6f2b51beb6f992b5b1de8b85a98bdf18de74096b724d17fa06219fc23f2bd5
       AGENTS_TOOLING_QA_MAX_FILES: '3'
-      # No PYTHONUTF8: the package must read and write its files as UTF-8 by itself,
-      # the way it runs on a student's Windows. Only the console output is UTF-8 here.
-      PYTHONIOENCODING: utf-8
+      # No PYTHONUTF8 and no PYTHONIOENCODING: the package reads and writes its files as
+      # UTF-8 and prints ASCII JSON on Windows by itself, as on a student's computer.
+      # The student's folder has a space and Cyrillic letters: TOOLING, venv, bge-m3 model,
+      # index and settings all live under it. (Environment values reach Windows
+      # PowerShell 5.1 steps as Unicode; only their script text must be ASCII.)
+      STUDENT_DIR_NAME: Папка ученика
     steps:
       - uses: actions/checkout@v4
       - name: Official Hermes 0.23.0 with the reviewed installer (newline-normalized pin)
@@ -58,42 +64,57 @@ jobs:
           foreach($p in 'tech','copywriter'){
             $dir=Join-Path $root $p
             New-Item -ItemType Directory -Force -Path (Join-Path $dir 'skills\lighthouse\references') | Out-Null
+            New-Item -ItemType Directory -Force -Path (Join-Path $dir 'skills\lighthouse\secrets') | Out-Null
+            New-Item -ItemType Directory -Force -Path (Join-Path $dir 'skills\lighthouse\notes') | Out-Null
             Set-Content -LiteralPath (Join-Path $dir 'skills\lighthouse\SKILL.md') -Encoding UTF8 -Value "# Маяк`nНавык про маяк и проверку локального поиска для профиля $p."
             Set-Content -LiteralPath (Join-Path $dir 'skills\lighthouse\references\note.md') -Encoding UTF8 -Value 'Справка: маяк светит кораблям ночью.'
+            # Secret canaries inside an indexed root: they must never reach the index or a log.
+            Set-Content -LiteralPath (Join-Path $dir 'skills\lighthouse\secrets\.env') -Encoding UTF8 -Value 'API_TOKEN=CANARY_TOKEN_9f3a'
+            Set-Content -LiteralPath (Join-Path $dir 'skills\lighthouse\notes\.env') -Encoding UTF8 -Value 'API_TOKEN=CANARY_TOKEN_9f3a'
             Set-Content -LiteralPath (Join-Path $dir 'AGENTS.md') -Encoding UTF8 -Value "# $p`nЛичное правило ученика."
             Set-Content -LiteralPath (Join-Path $dir 'SOUL.md') -Encoding UTF8 -Value "# Душа $p"
             Set-Content -LiteralPath (Join-Path $dir 'config.yaml') -Encoding UTF8 -Value "model:`n  provider: fixture`ndisplay:`n  name: Технарь $p"
             Set-Content -LiteralPath (Join-Path $dir 'auth.json') -Encoding UTF8 -Value 'CANARY-WINDOWS-SECRET'
           }
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\ci-logs" | Out-Null
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Tooling venv from the hashed locks; inventory finds official Hermes
-        shell: powershell
-        run: |
-          $ErrorActionPreference='Stop'
-          python -m venv "$env:RUNNER_TEMP\tv"
-          $py="$env:RUNNER_TEMP\tv\Scripts\python.exe"
-          # Windows needs both locks in this one venv: requirements.lock (MCP, documents) and
-          # requirements-whisper.lock (onnxruntime, tokenizers, numpy for bge-m3; faster-whisper).
-          & $py -m pip install -q --disable-pip-version-check --require-hashes -r requirements.lock; if($LASTEXITCODE){exit 1}
-          & $py -m pip install -q --disable-pip-version-check --require-hashes -r requirements-whisper.lock; if($LASTEXITCODE){exit 1}
-          & $py -m pip check; if($LASTEXITCODE){exit 1}
-          if(-not (Test-Path -LiteralPath "$env:RUNNER_TEMP\tv\Scripts\pythonw.exe")){throw 'pythonw.exe missing in the venv'}
-          $inv=& $py -B inventory.py | Out-String; $inv | Set-Content "$env:RUNNER_TEMP\inventory.json"
-          $d=$inv|ConvertFrom-Json
-          "INVENTORY hermes=$($d.hermesVersion) browser=$($d.browserMode) profiles=$(($d.profiles|%{$_.id}) -join ',')"
-          if($d.hermesVersion -ne '0.23.0'){throw 'inventory did not find official Hermes 0.23.0'}
-          if(@($d.profiles).Count -ne 2){throw 'inventory did not find the profiles'}
-          if($inv -match 'CANARY-WINDOWS-SECRET'){throw 'inventory leaked a secret'}
-      - name: Pinned bge-m3 ONNX model - fetch, repeat without changes, full SHA-256 check
+      - name: Package unpacked into the student folder, venv from the hashed locks, inventory
         shell: pwsh
         run: |
           $ErrorActionPreference='Stop'
-          [Console]::OutputEncoding=[Text.Encoding]::UTF8;$OutputEncoding=[Text.Encoding]::UTF8
-          $py="$env:RUNNER_TEMP\tv\Scripts\python.exe";$m="$env:RUNNER_TEMP\models\bge-m3-onnx";$t="$env:RUNNER_TEMP\tooling"
-          New-Item -ItemType Directory -Force $t|Out-Null
-          $c=Get-Content settings.windows.example.json -Raw|ConvertFrom-Json
+          $u=Join-Path $env:RUNNER_TEMP $env:STUDENT_DIR_NAME;$t="$u\tooling";$py="$u\venv\Scripts\python.exe"
+          New-Item -ItemType Directory -Force -Path $t | Out-Null
+          # The files a student gets in the ZIP (the release excludes .github/ and release/).
+          foreach($f in @(git -C $env:GITHUB_WORKSPACE ls-files)){
+            if($f -match '^(\.github|release)/'){continue}
+            $dst=Join-Path $t $f;New-Item -ItemType Directory -Force -Path (Split-Path -Parent $dst) | Out-Null
+            Copy-Item -LiteralPath (Join-Path $env:GITHUB_WORKSPACE $f) -Destination $dst
+          }
+          python -m venv "$u\venv"; if($LASTEXITCODE){throw 'venv failed'}
+          Set-Location -LiteralPath $t
+          # Windows needs both locks in this one venv: requirements.lock (MCP, documents) and
+          # requirements-whisper.lock (onnxruntime, tokenizers, numpy for bge-m3; faster-whisper).
+          & $py -m pip install -q --disable-pip-version-check --require-hashes -r requirements.lock; if($LASTEXITCODE){throw 'pip requirements.lock failed'}
+          & $py -m pip install -q --disable-pip-version-check --require-hashes -r requirements-whisper.lock; if($LASTEXITCODE){throw 'pip requirements-whisper.lock failed'}
+          & $py -m pip check; if($LASTEXITCODE){throw 'pip check failed'}
+          if(-not (Test-Path -LiteralPath "$u\venv\Scripts\pythonw.exe")){throw 'pythonw.exe missing in the venv'}
+          $inv=& $py -B inventory.py | Out-String; $inv | Set-Content -LiteralPath "$env:RUNNER_TEMP\ci-logs\inventory.txt" -Encoding utf8
+          $d=$inv|ConvertFrom-Json
+          "INVENTORY hermes=$($d.hermesVersion) browser=$($d.browserMode) arm64=$($d.windowsArm64) profiles=$(($d.profiles|%{$_.id}) -join ',')"
+          if($d.hermesVersion -ne '0.23.0'){throw 'inventory did not find official Hermes 0.23.0'}
+          if(@($d.profiles).Count -ne 2){throw 'inventory did not find the profiles'}
+          if($d.windowsArm64 -ne $false){throw 'inventory did not report the native machine'}
+          if($inv -match 'CANARY'){throw 'inventory leaked a secret'}
+      - name: Pinned bge-m3 ONNX model - fetch, repeat without changes, full SHA-256 check
+        shell: pwsh
+        timeout-minutes: 25
+        run: |
+          $ErrorActionPreference='Stop'
+          $u=Join-Path $env:RUNNER_TEMP $env:STUDENT_DIR_NAME;$t="$u\tooling";$py="$u\venv\Scripts\python.exe";$m="$u\models\bge-m3-onnx"
+          Set-Location -LiteralPath $t
+          $c=Get-Content -LiteralPath settings.windows.example.json -Raw|ConvertFrom-Json
           $c.kbFile="$t\kb\agents-student-kb.sqlite";$c.embeddingModelDir=$m
           [IO.File]::WriteAllText("$t\settings.json",($c|ConvertTo-Json -Depth 8))
           $first=& $py -B student_tools.py fetch-embedding-model --model-dir $m | Out-String;"FETCH1 $first"
@@ -107,107 +128,161 @@ jobs:
       # Cyrillic text: PowerShell 7 reads the step as UTF-8.
       - name: Doctor, bootstrap with index, Russian search, no-op repeat, one index at a time
         shell: pwsh
+        timeout-minutes: 20
         run: |
           $ErrorActionPreference='Stop'
           [Console]::OutputEncoding=[Text.Encoding]::UTF8;$OutputEncoding=[Text.Encoding]::UTF8
-          $py="$env:RUNNER_TEMP\tv\Scripts\python.exe";$t="$env:RUNNER_TEMP\tooling";$s="$t\settings.json";$h=Join-Path $env:LOCALAPPDATA 'hermes'
-          $dr=& $py -B student_tools.py --config $s doctor | Out-String;"DOCTOR $dr"
+          $u=Join-Path $env:RUNNER_TEMP $env:STUDENT_DIR_NAME;$t="$u\tooling";$py="$u\venv\Scripts\python.exe";$s="$t\settings.json"
+          $h=Join-Path $env:LOCALAPPDATA 'hermes';$logs="$env:RUNNER_TEMP\ci-logs"
+          Set-Location -LiteralPath $t
+          $dr=& $py -B student_tools.py --config $s doctor | Out-String;"DOCTOR $dr";$dr|Set-Content -LiteralPath "$logs\doctor1.txt"
           if($LASTEXITCODE){throw 'doctor failed'}
           $d=$dr|ConvertFrom-Json; if($d.backend -ne 'file' -or $d.embeddingDimensions -ne 1024 -or -not $d.local){throw 'unexpected doctor result'}
-          $first=& $py -B bootstrap.py --hermes-home $h --settings $s --index | Out-String;"BOOTSTRAP1 $first"
+          $first=& $py -B bootstrap.py --hermes-home $h --settings $s --index | Out-String;"BOOTSTRAP1 $first";$first|Set-Content -LiteralPath "$logs\bootstrap1.txt"
           $r=$first|ConvertFrom-Json; if($r.status -eq 'failed' -or $r.index.documentsWritten -lt 1 -or -not $r.changed -or -not $r.kbSchemaCreated){throw 'first bootstrap failed'}
-          $dr2=& $py -B student_tools.py --config $s doctor | Out-String;"DOCTOR2 $dr2"
+          $dr2=& $py -B student_tools.py --config $s doctor | Out-String;"DOCTOR2 $dr2";$dr2|Set-Content -LiteralPath "$logs\doctor2.txt"
           if($LASTEXITCODE -or ($dr2|ConvertFrom-Json).schema -ne 'ok' -or -not ($dr2|ConvertFrom-Json).wal){throw 'schema or WAL missing after bootstrap'}
-          $sr=& $py -B student_tools.py --config $s search "маяк кораблям" --profile tech --project __skills__ | Out-String
+          $sr=& $py -B student_tools.py --config $s search "маяк кораблям" --profile tech --project __skills__ | Out-String;$sr|Set-Content -LiteralPath "$logs\search.txt"
           "SEARCH $($sr.Substring(0,[Math]::Min(400,$sr.Length)))"
+          if($LASTEXITCODE){throw 'search failed'}
+          if($sr -match '[^\x00-\x7F]'){throw 'search output is not ASCII JSON'}
           $hits=@(($sr|ConvertFrom-Json).results)
           if($hits.Count -lt 1 -or (Split-Path -Leaf $hits[0].source) -ne 'note.md' -or $hits[0].content -notmatch 'кораблям'){throw 'Russian search did not find note.md first'}
-          $second=& $py -B bootstrap.py --hermes-home $h --settings $s --index | Out-String;"BOOTSTRAP2 $second"
+          $second=& $py -B bootstrap.py --hermes-home $h --settings $s --index | Out-String;"BOOTSTRAP2 $second";$second|Set-Content -LiteralPath "$logs\bootstrap2.txt"
           $r2=$second|ConvertFrom-Json; if($r2.changed -ne $false -or $r2.changedFiles -ne 0 -or $r2.index.documentsWritten -ne 0){throw 'repeat bootstrap changed something'}
           foreach($p in 'tech','copywriter'){
             foreach($f in 'AGENTS.md','SOUL.md'){$x=Get-Content -Raw -Encoding UTF8 (Join-Path $h "profiles\$p\$f");$n=([regex]::Matches($x,'agents-student-tooling:start')).Count;if($n -ne 1){throw "block $p/$f=$n"};if($f -eq 'AGENTS.md' -and $x -notmatch 'Личное правило ученика'){throw 'personal text lost'}}
             $y=Get-Content -Raw -Encoding UTF8 (Join-Path $h "profiles\$p\config.yaml")
-            if($y -notmatch "Технарь $p" -or $y -notmatch 'student-agent-kb'){throw "config.yaml of $p lost Cyrillic text or the MCP entry"}
+            if($y -notmatch "Технарь $p" -or $y -notmatch 'student-agent-kb' -or $y -notmatch [regex]::Escape($env:STUDENT_DIR_NAME)){throw "config.yaml of $p lost Cyrillic text or the MCP entry"}
           }
           # The index lock (msvcrt on Windows): a second index while one holds it does nothing.
           $code=@(
             'import importlib.util,json,subprocess,sys'
             'spec=importlib.util.spec_from_file_location(''t'',''student_tools.py'');t=importlib.util.module_from_spec(spec);spec.loader.exec_module(t)'
             'lock=t.IndexLock(t.guard(t.config(sys.argv[1])[''kbFile'']));assert lock.acquire()'
-            'r=subprocess.run([sys.executable,''-B'',''student_tools.py'',''--config'',sys.argv[1],''index''],capture_output=True,text=True);lock.release()'
+            'r=subprocess.run([sys.executable,''-B'',''student_tools.py'',''--config'',sys.argv[1],''index''],capture_output=True,text=True,stdin=subprocess.DEVNULL);lock.release()'
             'print(r.stdout.strip());sys.exit(0 if json.loads(r.stdout)=={''status'':''index-already-running''} else 1)'
           ) -join "`n"
           Set-Content -LiteralPath "$env:RUNNER_TEMP\lock-check.py" -Encoding ascii -Value $code
           & $py -B "$env:RUNNER_TEMP\lock-check.py" $s; if($LASTEXITCODE){throw 'a second index ran while the first held the lock'}
           'TOOLING_IDEMPOTENT changed=false, blocks intact, Cyrillic config intact, lock holds'
+      # Cyrillic text: PowerShell 7 reads the step as UTF-8.
       - name: Real stdio MCP call of agent_kb_search (direct, and through the vault-mcp launcher)
         shell: pwsh
+        timeout-minutes: 12
+        env:
+          # QA only (needs AGENTS_TOOLING_QA_MAX_FILES): the server frees the model after 3 s,
+          # so the second call (after 6 s) loads it anew while the stdin read is pending.
+          AGENTS_TOOLING_QA_KEEPALIVE_SECONDS: '3'
         run: |
           $ErrorActionPreference='Stop'
           [Console]::OutputEncoding=[Text.Encoding]::UTF8;$OutputEncoding=[Text.Encoding]::UTF8
-          $py="$env:RUNNER_TEMP\tv\Scripts\python.exe";$s="$env:RUNNER_TEMP\tooling\settings.json"
-          $direct=& $py -B release\mcp-smoke.py --settings $s --query 'маяк кораблям' --expect note.md | Out-String;"MCP_DIRECT $direct"
-          if($LASTEXITCODE){throw 'MCP stdio search failed'}
+          $u=Join-Path $env:RUNNER_TEMP $env:STUDENT_DIR_NAME;$t="$u\tooling";$py="$u\venv\Scripts\python.exe";$s="$t\settings.json";$logs="$env:RUNNER_TEMP\ci-logs"
+          $smoke=Join-Path $env:GITHUB_WORKSPACE 'release\mcp-smoke.py'
+          Set-Location -LiteralPath $t
+          $env:AGENTS_TOOLING_QA_STACKS="$env:RUNNER_TEMP\stacks-mcp-direct.txt"
+          $direct=& $py -B $smoke --tools "$t\student_tools.py" --settings $s --query 'маяк кораблям' --expect note.md --again 6 --timeout 300 | Out-String
+          $code=$LASTEXITCODE;"MCP_DIRECT exit=$code $direct";$direct|Set-Content -LiteralPath "$logs\mcp-direct.txt"
+          if($code){throw "MCP stdio search failed (exit $code; 3 = timeout)"}
           # vault-mcp has no exec on Windows: launch_mcp runs the server as a child on this stdio.
-          $child=& $py -B release\mcp-smoke.py --settings $s --query 'маяк кораблям' --expect note.md --via-launcher | Out-String;"MCP_VIA_LAUNCHER $child"
-          if($LASTEXITCODE){throw 'MCP stdio search through launch_mcp failed'}
+          $env:AGENTS_TOOLING_QA_STACKS="$env:RUNNER_TEMP\stacks-mcp-launcher.txt"
+          $child=& $py -B $smoke --tools "$t\student_tools.py" --settings $s --query 'маяк кораблям' --expect note.md --again 6 --timeout 300 --via-launcher | Out-String
+          $code=$LASTEXITCODE;"MCP_VIA_LAUNCHER exit=$code $child";$child|Set-Content -LiteralPath "$logs\mcp-launcher.txt"
+          if($code){throw "MCP stdio search through launch_mcp failed (exit $code; 3 = timeout)"}
       - name: Index refresh as a per-user scheduled task (no administrator rights, no resident process)
         shell: pwsh
+        timeout-minutes: 10
         run: |
           $ErrorActionPreference='Stop'
-          $py="$env:RUNNER_TEMP\tv\Scripts\python.exe";$t="$env:RUNNER_TEMP\tooling";$s="$t\settings.json";$task='AgentsTooling-KB-Index'
+          $u=Join-Path $env:RUNNER_TEMP $env:STUDENT_DIR_NAME;$t="$u\tooling";$py="$u\venv\Scripts\python.exe";$s="$t\settings.json";$logs="$env:RUNNER_TEMP\ci-logs"
+          Set-Location -LiteralPath $t
+          $status="$t\index-status.json";$task=$null
           try{
             $one=& $py -B student_tools.py --config $s schedule-index --interval-minutes 5 | Out-String;"SCHEDULE1 $one"
             if($LASTEXITCODE -or ($one|ConvertFrom-Json).changed -ne $true){throw 'schedule-index failed'}
+            $task=($one|ConvertFrom-Json).task
+            if($task -notmatch '^AgentsTooling-KB-Index-[A-Za-z0-9_-]+$'){throw "unexpected task name $task"}
             $two=& $py -B student_tools.py --config $s schedule-index --interval-minutes 5 | Out-String;"SCHEDULE2 $two"
             if($LASTEXITCODE -or ($two|ConvertFrom-Json).changed -ne $false){throw 'schedule-index is not idempotent'}
-            # schtasks may write the XML as UTF-16; drop the NULs so ASCII patterns match either way.
-            $xml=(& schtasks.exe /Query /TN $task /XML | Out-String) -replace "`0",''
-            if($xml -notmatch 'PT5M' -or $xml -notmatch 'pythonw\.exe' -or $xml -notmatch 'LeastPrivilege' -or $xml -notmatch 'IgnoreNew'){throw 'unexpected task definition'}
-            $status="$t\index-status.json"; if(Test-Path -LiteralPath $status){Remove-Item -LiteralPath $status}
+            # The registered definition, read through the Task Scheduler API (the same XML as
+            # schtasks /Query /XML, but as Unicode text: the paths here are Cyrillic).
+            $def=[xml](Export-ScheduledTask -TaskName $task)
+            $exec=$def.Task.Actions.Exec;$cmd=[string]$exec.Command;$arguments=[string]$exec.Arguments
+            "TASK command=$cmd arguments=$arguments"
+            if([string]$def.Task.Triggers.TimeTrigger.Repetition.Interval -ne 'PT5M' -or [string]$def.Task.Principals.Principal.RunLevel -ne 'LeastPrivilege' -or [string]$def.Task.Settings.MultipleInstancesPolicy -ne 'IgnoreNew'){throw 'unexpected task definition'}
+            if($cmd -ne "$u\venv\Scripts\pythonw.exe" -or $arguments -notmatch [regex]::Escape('"'+$s+'"') -or $arguments -notmatch ' index --status-file '){throw 'task command or quoting is wrong'}
+            if(Test-Path -LiteralPath $status){Remove-Item -LiteralPath $status}
             & schtasks.exe /Run /TN $task | Out-Null
-            $deadline=(Get-Date).AddSeconds(240);while(-not (Test-Path -LiteralPath $status) -and (Get-Date) -lt $deadline){Start-Sleep 3}
-            if(Test-Path -LiteralPath $status){
-              $body=Get-Content -Raw -Encoding UTF8 $status;"SCHEDULED_RUN $body"
-              if(($body|ConvertFrom-Json).status -ne 'ok'){throw 'the scheduled index run failed'}
-            }else{
-              # The runner session may not allow interactive-logon tasks to start: reported, not hidden.
-              'SCHEDULED_RUN_NOT_OBSERVED (task registered; the runner did not start it within 240 s)'
-              & schtasks.exe /Query /TN $task /V /FO LIST | Select-String -Pattern 'Status|Last Result|Logon Mode'
+            $deadline=(Get-Date).AddSeconds(180);while(-not (Test-Path -LiteralPath $status) -and (Get-Date) -lt $deadline){Start-Sleep 3}
+            $observed=Test-Path -LiteralPath $status;$direct='not-needed'
+            if(-not $observed){
+              # The runner session may not start interactive-logon tasks: run exactly the
+              # registered command line once, without the scheduler, and say so.
+              $p=Start-Process -FilePath $cmd -ArgumentList $arguments -WorkingDirectory $t -Wait -PassThru -WindowStyle Hidden
+              if($p.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $status)){throw "the registered command failed (exit $($p.ExitCode))"}
+              $direct='ok'
             }
+            $body=Get-Content -Raw -Encoding UTF8 -LiteralPath $status;$body|Set-Content -LiteralPath "$logs\index-status.txt"
+            if(($body|ConvertFrom-Json).status -ne 'ok'){throw "the scheduled index run did not end with status ok: $body"}
+            "SCHEDULED_RESULT {""scheduledRunObserved"":$($observed.ToString().ToLower()),""directRun"":""$direct"",""status"":""ok""}"
           }finally{
             $gone=& $py -B student_tools.py --config $s unschedule-index | Out-String;"UNSCHEDULE $gone"
           }
-          & schtasks.exe /Query /TN $task 2>$null | Out-Null; if($LASTEXITCODE -eq 0){throw 'the task is still registered'}
+          if($task){& schtasks.exe /Query /TN $task 2>$null | Out-Null; if($LASTEXITCODE -eq 0){throw 'the task is still registered'}}
           $global:LASTEXITCODE=0
       # Cyrillic text: PowerShell 7 reads the step as UTF-8; Windows PowerShell 5.1 would
       # read the BOM-less script in cp1252 and break its strings.
-      - name: Pinned Whisper model and offline transcription of a short Russian phrase
+      - name: Pinned Whisper model; network block proven; offline transcription and KB search
         shell: pwsh
+        timeout-minutes: 20
         run: |
           $ErrorActionPreference='Stop'
           [Console]::OutputEncoding=[Text.Encoding]::UTF8;$OutputEncoding=[Text.Encoding]::UTF8
-          $py="$env:RUNNER_TEMP\tv\Scripts\python.exe";$m="$env:RUNNER_TEMP\models\small"
+          $u=Join-Path $env:RUNNER_TEMP $env:STUDENT_DIR_NAME;$t="$u\tooling";$py="$u\venv\Scripts\python.exe"
+          # The Whisper weights stay on an ASCII path: CTranslate2 opening a Cyrillic path on an
+          # English (cp1252) Windows is not part of this run (FOR-CODEX says so).
+          $m="$env:RUNNER_TEMP\models\small"
+          Set-Location -LiteralPath $t
           & $py -B student_tools.py fetch-whisper-model --model-dir $m; if($LASTEXITCODE){exit 1}
           $again=& $py -B student_tools.py fetch-whisper-model --model-dir $m | Out-String; if(($again|ConvertFrom-Json).changed -ne $false){throw 'model fetch not idempotent'}
-          # Offline for real. A Windows venv python.exe is a redirector: the base interpreter
-          # it starts opens the sockets, so block both, and give the process a dead proxy too.
+          # The proof that the block is real: no proxy, a direct HTTPS request and a raw TCP
+          # connection. Before the block they reach the network; under it both must fail.
+          $probe=@(
+            'import socket,sys,urllib.request'
+            'reached=0'
+            'try:'
+            '    urllib.request.build_opener(urllib.request.ProxyHandler({})).open(''https://huggingface.co'',timeout=10).close();reached|=1'
+            'except Exception:pass'
+            'try:'
+            '    socket.create_connection((''huggingface.co'',443),timeout=5).close();reached|=2'
+            'except Exception:pass'
+            'print(''NET_PROBE reached=%d''%reached);sys.exit(reached)'
+          ) -join "`n"
+          Set-Content -LiteralPath "$env:RUNNER_TEMP\net-probe.py" -Encoding ascii -Value $probe
+          & $py -B "$env:RUNNER_TEMP\net-probe.py"; if($LASTEXITCODE -eq 0){throw 'the probe cannot reach huggingface.co even before the block: the offline check would prove nothing'}
+          $ips=@([Net.Dns]::GetHostAddresses('huggingface.co')|ForEach-Object{$_.IPAddressToString})
+          $hosts="$env:SystemRoot\System32\drivers\etc\hosts";$hostsBefore=[IO.File]::ReadAllBytes($hosts)
           $exes=@(& $py -c "import sys;print(sys.executable);print(sys._base_executable)")|ForEach-Object{$_.Trim()}|Where-Object{$_}|Sort-Object -Unique
-          $i=0;foreach($e in $exes){$i++;New-NetFirewallRule -DisplayName "tooling-offline-asr-$i" -Direction Outbound -Action Block -Program $e | Out-Null}
           $saved=@{};foreach($k in 'HTTPS_PROXY','HTTP_PROXY','ALL_PROXY','NO_PROXY'){$saved[$k]=[Environment]::GetEnvironmentVariable($k)}
-          $env:HTTPS_PROXY='http://127.0.0.1:9';$env:HTTP_PROXY='http://127.0.0.1:9';$env:ALL_PROXY='http://127.0.0.1:9';$env:NO_PROXY=''
+          $i=0
           try{
-            & $py -c "import urllib.request,sys;urllib.request.urlopen('https://huggingface.co',timeout=10);sys.exit(0)" 2>$null
-            if($LASTEXITCODE -eq 0){throw 'OFFLINE_NOT_ENFORCED: the interpreter still reaches the network'}
-            'OFFLINE_ENFORCED'
+            New-NetFirewallRule -DisplayName 'tooling-offline-hf' -Direction Outbound -Action Block -RemoteAddress $ips | Out-Null
+            foreach($e in $exes){$i++;New-NetFirewallRule -DisplayName "tooling-offline-asr-$i" -Direction Outbound -Action Block -Program $e | Out-Null}
+            [IO.File]::AppendAllText($hosts,"`r`n0.0.0.0 huggingface.co`r`n:: huggingface.co`r`n",[Text.Encoding]::ASCII)
+            Clear-DnsClientCache
+            $env:HTTPS_PROXY='http://127.0.0.1:9';$env:HTTP_PROXY='http://127.0.0.1:9';$env:ALL_PROXY='http://127.0.0.1:9';$env:NO_PROXY=''
+            & $py -B "$env:RUNNER_TEMP\net-probe.py"; if($LASTEXITCODE -ne 0){throw "OFFLINE_NOT_ENFORCED: the interpreter still reaches huggingface.co (reached=$LASTEXITCODE)"}
+            'OFFLINE_ENFORCED (direct HTTPS and raw TCP both blocked)'
             $out=& $py -B student_tools.py transcribe --model-dir $m --audio tests\fixtures\ru-phrase.wav --output "$env:RUNNER_TEMP\asr.json" | Out-String
             if($LASTEXITCODE){throw "offline transcription failed: $out"}
             # The knowledge base is offline too: search embeds the query in-process.
-            $kb=& $py -B student_tools.py --config "$env:RUNNER_TEMP\tooling\settings.json" search "маяк кораблям" | Out-String
+            $kb=& $py -B student_tools.py --config "$t\settings.json" search "маяк кораблям" | Out-String
             if($LASTEXITCODE -or @(($kb|ConvertFrom-Json).results).Count -lt 1){throw 'offline knowledge-base search failed'}
             'KB_SEARCH_OFFLINE_OK'
           }finally{
-            1..$i|ForEach-Object{Remove-NetFirewallRule -DisplayName "tooling-offline-asr-$_" -ErrorAction SilentlyContinue}
+            [IO.File]::WriteAllBytes($hosts,$hostsBefore);Clear-DnsClientCache
+            Remove-NetFirewallRule -DisplayName 'tooling-offline-hf' -ErrorAction SilentlyContinue
+            if($i){1..$i|ForEach-Object{Remove-NetFirewallRule -DisplayName "tooling-offline-asr-$_" -ErrorAction SilentlyContinue}}
             foreach($k in $saved.Keys){[Environment]::SetEnvironmentVariable($k,$saved[$k])}
           }
           $asr=Get-Content -Raw -Encoding UTF8 "$env:RUNNER_TEMP\asr.json"|ConvertFrom-Json
@@ -217,9 +292,12 @@ jobs:
       # this run. Its result decides what FOR-CODEX says about the browser on Windows.
       - name: Hermes Chromium headless smoke (informational)
         continue-on-error: true
-        shell: powershell
+        shell: pwsh
+        timeout-minutes: 15
         run: |
           $ErrorActionPreference='Stop'
+          $u=Join-Path $env:RUNNER_TEMP $env:STUDENT_DIR_NAME;$t="$u\tooling"
+          Set-Location -LiteralPath $t
           $hermes=Join-Path $env:LOCALAPPDATA 'hermes\bin\hermes.exe'
           if(-not (Test-Path -LiteralPath $hermes)){$hermes=(Get-Command hermes -ErrorAction Stop).Source}
           $hpy=Join-Path $env:LOCALAPPDATA 'hermes\hermes-agent\venv\Scripts\python.exe'
@@ -241,17 +319,30 @@ jobs:
           if($exe.Count -ne 1){throw 'bws.exe not found in the archive'}
           $version=(& $exe[0].FullName --version 2>&1|Out-String).Trim();"BWS $version"
           if($version -notmatch [regex]::Escape($env:BWS_VERSION)){throw 'unexpected bws version'}
-      - name: No secret copied into the tooling folder, the index or the instructions
+      - name: No secret in the index (with -wal/-shm), the status file, the logs or the instructions
         shell: pwsh
         run: |
           $ErrorActionPreference='Stop'
-          $roots=@("$env:RUNNER_TEMP\tooling",(Join-Path $env:LOCALAPPDATA 'hermes\profiles'))
+          $u=Join-Path $env:RUNNER_TEMP $env:STUDENT_DIR_NAME;$t="$u\tooling"
+          $kb="$t\kb\agents-student-kb.sqlite"
+          if(-not (Test-Path -LiteralPath $kb)){throw 'the index file is missing: the check would prove nothing'}
+          if(-not (Test-Path -LiteralPath "$t\index-status.json")){throw 'the status file is missing'}
+          $files=@(Get-Item -LiteralPath $kb,"$t\index-status.json","$t\settings.json")
+          $files+=@(Get-ChildItem -Path "$kb-*" -File -ErrorAction SilentlyContinue)
+          foreach($d in "$t\kb","$t\index-context","$t\integration-backups","$env:RUNNER_TEMP\ci-logs"){if(Test-Path -LiteralPath $d){$files+=@(Get-ChildItem -LiteralPath $d -Recurse -File)}}
+          $files+=@(Get-ChildItem -LiteralPath (Join-Path $env:LOCALAPPDATA 'hermes\profiles') -Recurse -File | Where-Object { $_.Name -notin 'auth.json','.env' })
           $bad=@()
-          foreach($r in $roots){
-            Get-ChildItem -LiteralPath $r -Recurse -File | Where-Object { $_.Name -ne 'auth.json' } | ForEach-Object {
-              $raw=[Text.Encoding]::Latin1.GetString([IO.File]::ReadAllBytes($_.FullName))
-              if($raw.Contains('CANARY-WINDOWS-SECRET')){$bad+=$_.FullName}
-            }
+          foreach($f in ($files|Sort-Object FullName -Unique)){
+            $raw=[Text.Encoding]::Latin1.GetString([IO.File]::ReadAllBytes($f.FullName))
+            if($raw.Contains('CANARY-WINDOWS-SECRET') -or $raw.Contains('CANARY_TOKEN_9f3a')){$bad+=$f.FullName}
           }
           if($bad){throw "secret copied into: $($bad -join ', ')"}
-          'NO_SECRET_COPIED (tooling, SQLite index with WAL, profiles)'
+          "NO_SECRET_COPIED ($($files.Count) files: SQLite index with WAL, status, logs, profiles)"
+      - name: Thread dumps and logs of a failed run
+        if: failure()
+        shell: pwsh
+        run: |
+          foreach($f in @(Get-ChildItem -Path "$env:RUNNER_TEMP\stacks-*.txt","$env:RUNNER_TEMP\ci-logs\*" -File -ErrorAction SilentlyContinue)){
+            "===== $($f.FullName) ($($f.Length) bytes)"
+            Get-Content -LiteralPath $f.FullName -Raw -ErrorAction SilentlyContinue
+          }

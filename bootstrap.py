@@ -24,6 +24,23 @@ BRAIN_FILES=('AGENTS.md','SOUL.md','IDENTITY.md','OUTPUT_STANDARDS.md','FIRST_RU
 WINDOWS=os.name=='nt'
 
 
+def dump_json(value,ensure_ascii=True,**kw):
+    """Windows: always ASCII JSON, so no console code page can break the output."""
+    return json.dumps(value,ensure_ascii=True if WINDOWS else ensure_ascii,**kw)
+
+
+def settings_text(path):
+    """UTF-16 with a BOM, UTF-8 with or without one (as student_tools.settings_text)."""
+    data=Path(path).read_bytes()
+    if data[:2] in (b'\xff\xfe',b'\xfe\xff'):return data.decode('utf-16')
+    return data.decode('utf-8-sig')
+
+
+def same_path(a,b):
+    """Windows paths ignore letter case; elsewhere a path is its exact text."""
+    return os.path.normcase(a)==os.path.normcase(b) if WINDOWS else a==b
+
+
 class BootstrapError(ValueError):
     """A refusal with a fixed text that is safe and meant to be shown as is."""
 
@@ -38,10 +55,16 @@ def ours(entry):
             and args[4] in ('mcp','vault-mcp'))
 
 
+def reparse_point(path):
+    try:st=os.lstat(path)
+    except OSError:return False
+    return bool(getattr(st,'st_file_attributes',0)&0x400)  # FILE_ATTRIBUTE_REPARSE_POINT: junctions too
+
+
 def safe(path):
     path=Path(path).absolute()
     for part in [path,*path.parents]:
-        if part.is_symlink():raise ValueError('Linked destination preserved')
+        if part.is_symlink() or (WINDOWS and reparse_point(part)):raise ValueError('Linked destination preserved')
     return path
 
 
@@ -76,9 +99,8 @@ def prepare(hermes_home,settings,via_vault=False,initial_index=False,enable_brow
     root=safe(hermes_home);settings=safe(settings)
     state=inventory.scan(hermes_home=root)
     if not state['profiles']:raise BootstrapError('Не найдены установленные профили агентов курса. Дооснащение ставится только поверх установленных агентов.')
-    # Explicit UTF-8: on Windows the default is the ANSI code page and would garble Cyrillic
-    # (utf-8-sig also accepts the BOM that Windows PowerShell 5.1 writes).
-    cfg=json.loads(settings.read_text(encoding='utf-8-sig'))
+    # Explicit encodings: on Windows the default is the ANSI code page and would garble Cyrillic.
+    cfg=json.loads(settings_text(settings))
     if cfg.get('schemaVersion')!=1 or cfg.get('embeddingModel')!='bge-m3' or cfg.get('embeddingDimensions')!=1024:
         raise ValueError('Review settings and vector schema first')
     if any(k in cfg.get('database',{}) for k in ('password','dsn','connectionString')):
@@ -88,9 +110,10 @@ def prepare(hermes_home,settings,via_vault=False,initial_index=False,enable_brow
         raise BootstrapError('На Windows база знаний работает только с backend file (SQLite + ONNX, без PostgreSQL и Ollama). '
                              'Укажи "backend": "file" в settings.json по образцу settings.windows.example.json.')
     schema_created=False
-    if initial_index or kind=='file':
+    if initial_index or kind=='file' or WINDOWS:
         spec=importlib.util.spec_from_file_location('student_tools',HERE/'student_tools.py')
         tools=importlib.util.module_from_spec(spec);spec.loader.exec_module(tools)
+    if WINDOWS and tools.windows_native_arm64():raise BootstrapError(tools.ARM_REFUSAL)
     if kind=='file':
         # The base is one SQLite file: its schema is created here, no psql or schema.sql.
         schema_created=tools.ensure_kb_schema(tools.config(settings))
@@ -104,7 +127,7 @@ def prepare(hermes_home,settings,via_vault=False,initial_index=False,enable_brow
             path=safe(folder/relative)
             if path.is_dir():
                 item={'path':str(path),'profile':name,'project':'__skills__'}
-                if not any(x.get('path')==str(path) and x.get('project')=='__skills__' for x in roots):roots.append(item)
+                if not any(same_path(x.get('path',''),str(path)) and x.get('project')=='__skills__' for x in roots):roots.append(item)
         snapshot=safe(settings.parent/'index-context'/name)
         texts=[]
         for filename in BRAIN_FILES:
@@ -117,7 +140,7 @@ def prepare(hermes_home,settings,via_vault=False,initial_index=False,enable_brow
             # Only existing approved instruction text, never runtime/auth/config.
             changes[snapshot/'profile-context.md']=('\n\n'.join('# '+n+'\n\n'+without_block(t) for n,t in texts)+'\n').encode()
             item={'path':str(snapshot),'profile':name,'project':'__skills__'}
-            if not any(x.get('path')==str(snapshot) for x in roots):roots.append(item)
+            if not any(same_path(x.get('path',''),str(snapshot)) for x in roots):roots.append(item)
         config_path=safe(folder/'config.yaml')
         current=yaml.safe_load(config_path.read_text(encoding='utf-8')) if config_path.is_file() else {}
         if not isinstance(current,dict):raise ValueError('Unexpected profile config; preserve it')
@@ -222,14 +245,14 @@ if __name__=='__main__':
             if stream is not None and hasattr(stream,'reconfigure'):stream.reconfigure(errors='backslashreplace')
     try:
         result=inventory.scan(hermes_home=a.hermes_home) if a.inspect else prepare(a.hermes_home,a.settings,a.via_vault,a.index,a.enable_headless_config)
-        print(json.dumps(result,ensure_ascii=False,indent=2))
+        print(dump_json(result,ensure_ascii=False,indent=2))
     except BootstrapError as error:
-        print(json.dumps({'status':'failed','errorClass':'BootstrapError','message':str(error)},ensure_ascii=False))
+        print(dump_json({'status':'failed','errorClass':'BootstrapError','message':str(error)},ensure_ascii=False))
         sys.exit(1)
     except Exception as error:
         # The student tools' own fixed texts (pins, retries, database rights) are safe to show.
         if type(error).__name__=='StudentFacingError':
-            print(json.dumps({'status':'failed','errorClass':'StudentFacingError','message':str(error)},ensure_ascii=False))
+            print(dump_json({'status':'failed','errorClass':'StudentFacingError','message':str(error)},ensure_ascii=False))
             sys.exit(1)
-        print(json.dumps({'status':'failed','errorClass':type(error).__name__,'message':'Review local preflight and saved backup; raw config and credentials suppressed.'}))
+        print(dump_json({'status':'failed','errorClass':type(error).__name__,'message':'Review local preflight and saved backup; raw config and credentials suppressed.'}))
         sys.exit(1)

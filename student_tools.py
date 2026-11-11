@@ -10,6 +10,7 @@ import json
 import math
 import os
 from pathlib import Path
+import platform
 import re
 import shutil
 import subprocess
@@ -62,6 +63,64 @@ KB_SCHEMA_VERSION='1'
 # The MCP server frees the in-process model after this idle time (Ollama keep_alive 2m).
 EMBED_KEEP_ALIVE_SECONDS=120
 INDEX_TASK_NAME='AgentsTooling-KB-Index'
+ARM_REFUSAL='Windows ARM пока не поддерживается: только диагностика'
+# Secret-like names are skipped in any letter case on every OS (.env, AUTH.JSON, Secrets/).
+SECRET_NAMES={'.env','auth.json','credentials','secrets','cookies','.ssh','.gnupg','.netrc','.pgpass',
+              'id_rsa','id_dsa','id_ecdsa','id_ed25519'}
+SECRET_SUFFIXES=('.pem','.key','.p12','.pfx','.kdbx')
+FILE_ATTRIBUTE_REPARSE_POINT=0x400
+
+
+def dump_json(value,ensure_ascii=True,**kw):
+    """JSON for the console. Windows: always ASCII, so a cp866/cp1251 console, a pipe in
+    the ANSI code page or a character outside the BMP can never break the output."""
+    return json.dumps(value,ensure_ascii=True if IS_WINDOWS else ensure_ascii,**kw)
+
+
+def settings_text(path):
+    """settings.json as text: UTF-16 with a BOM (Notepad, some PowerShell writers), UTF-8 with
+    or without a BOM. A BOM-less UTF-8 file reads exactly as before."""
+    data=Path(path).read_bytes()
+    if data[:2] in (b'\xff\xfe',b'\xfe\xff'):return data.decode('utf-16')
+    return data.decode('utf-8-sig')
+
+
+def reparse_point(path):
+    """Windows: a junction, a symlink or another reparse point (never followed)."""
+    try:st=os.lstat(path)
+    except OSError:return False
+    return bool(getattr(st,'st_file_attributes',0)&FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def linked(path):
+    return Path(path).is_symlink() or (IS_WINDOWS and reparse_point(path))
+
+
+def secret_like(name):
+    low=name.lower()
+    return low in SECRET_NAMES or low.startswith('.env') or low.endswith(SECRET_SUFFIXES)
+
+
+def excluded_name(name):
+    # Windows file names ignore case: Logs, CONFIG.YAML and logs are the same thing there.
+    return (os.path.normcase(name) if IS_WINDOWS else name) in EXCLUDED or secret_like(name)
+
+
+def windows_native_arm64():
+    """True on Windows ARM64, also for an x64 Python running under emulation there."""
+    if not IS_WINDOWS:return False
+    if platform.machine().upper() in ('ARM64','AARCH64'):return True
+    try:
+        import ctypes
+        from ctypes import wintypes
+        kernel32=ctypes.WinDLL('kernel32',use_last_error=True)
+        check=kernel32.IsWow64Process2
+    except (OSError,AttributeError):return False
+    check.argtypes=[wintypes.HANDLE,ctypes.POINTER(wintypes.USHORT),ctypes.POINTER(wintypes.USHORT)];check.restype=wintypes.BOOL
+    kernel32.GetCurrentProcess.restype=wintypes.HANDLE
+    process=wintypes.USHORT();native=wintypes.USHORT()
+    if not check(kernel32.GetCurrentProcess(),ctypes.byref(process),ctypes.byref(native)):return False
+    return native.value==0xAA64  # IMAGE_FILE_MACHINE_ARM64
 
 
 class StudentFacingError(ValueError):
@@ -175,13 +234,13 @@ def digest(data):return hashlib.sha256(data).hexdigest()
 def guard(path):
     path=Path(path).absolute()
     for part in [path,*path.parents]:
-        if part.is_symlink():raise ValueError('Linked path refused')
+        if part.is_symlink() or (IS_WINDOWS and reparse_point(part)):raise ValueError('Linked path refused')
     return path
 
 
 def config(path):
     # utf-8-sig: Windows PowerShell 5.1 writes UTF-8 with a BOM; a BOM-less file reads the same.
-    d=json.loads(guard(path).read_text(encoding='utf-8-sig'))
+    d=json.loads(settings_text(guard(path)))
     if d.get('schemaVersion')!=1 or d.get('embeddingDimensions')!=1024 or d.get('embeddingModel')!='bge-m3':
         raise ValueError('Review embedding schema before changing model or dimensions')
     kind=d.get('backend','postgres')
@@ -201,7 +260,8 @@ def config(path):
                                  'нужна закреплённая модель '+BGE_M3_DIGEST[:12]+'…; сообщи в поддержку.')
     for item in d.get('roots',[]):
         root=guard(item['path'])
-        if root==Path.home() or len(root.parts)<3 or not item.get('project'):
+        home=os.path.normcase(str(Path.home()))==os.path.normcase(str(root)) if IS_WINDOWS else root==Path.home()
+        if home or len(root.parts)<3 or not item.get('project'):
             raise ValueError('Register a specific source folder, not HOME or disk root')
         if item.get('profile') not in {*PROFILES,'shared'}:raise ValueError('Unknown source profile')
     return d
@@ -217,17 +277,24 @@ def chunks(text,size=1800,overlap=220):
     return result
 
 
-def candidates(root):
+def candidates(root,problems=None):
+    """Indexable files under root. With problems (a dict), a file that cannot be examined
+    (no access, a path too long for Windows) is counted there and skipped, never fatal."""
     root=guard(root)
     if not root.is_dir():raise ValueError('Registered root missing')
     for folder,dirs,files in os.walk(root,followlinks=False):
-        dirs[:]=[n for n in dirs if n not in EXCLUDED and not n.startswith('.') and not (Path(folder)/n).is_symlink()]
+        dirs[:]=[n for n in dirs if not excluded_name(n) and not n.startswith('.') and not linked(Path(folder)/n)]
         for name in sorted(files):
             path=Path(folder)/name
-            if name in EXCLUDED or name.startswith(('.','~$')) or path.suffix.lower() not in EXTENSIONS:continue
-            if path.suffix.lower() in {'.json','.yaml','.yml'} and re.match(r'(?i)(auth|cookies?|credentials?|tokens?|sessions?)(?:[._-]|$)',name):continue
-            if path.is_symlink():continue
-            st=path.stat()
+            if excluded_name(name) or name.startswith(('.','~$')) or path.suffix.lower() not in EXTENSIONS:continue
+            if path.suffix.lower() in {'.json','.yaml','.yml'} and re.match(r'(?i)(auth|cookies?|credentials?|tokens?|sessions?|secrets?)(?:[._-]|$)',name):continue
+            try:
+                if linked(path):continue
+                st=path.stat()
+            except OSError:
+                if problems is None:raise
+                reason='tooLong' if IS_WINDOWS and len(str(path))>=260 else 'unreadable'
+                problems[reason]=problems.get(reason,0)+1;continue
             if st.st_nlink!=1 or not path.is_file() or st.st_size>8*1024*1024:continue
             yield path
 
@@ -352,7 +419,7 @@ def index(cfg):
                     except OSError:mark=None
                     if REPORTED_SKIPS.get(str(path))!=mark:
                         REPORTED_SKIPS[str(path)]=mark
-                        print(json.dumps({'status':'source-skipped','file':str(path),'reason':type(error).__name__},ensure_ascii=False),file=sys.stderr,flush=True)
+                        print(dump_json({'status':'source-skipped','file':str(path),'reason':type(error).__name__},ensure_ascii=False),file=sys.stderr,flush=True)
                     continue
                 if not text.strip():skipped+=1;continue
                 content_hash=digest(text.encode())
@@ -655,7 +722,11 @@ def kb_connect(cfg,create=False):
     path=guard(cfg['kbFile'])
     if not create and not path.is_file():
         raise StudentFacingError('Файла базы знаний ещё нет ('+str(path)+'). Выполни bootstrap.py: он создаёт её схему.')
-    if create:path.parent.mkdir(parents=True,exist_ok=True)
+    if create:
+        path.parent.mkdir(parents=True,exist_ok=True)
+        if not IS_WINDOWS and not path.exists():
+            # Only this user reads the index (SQLite gives -wal/-shm the same mode).
+            os.close(os.open(path,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600))
     db=sqlite3.connect(str(path),timeout=30,isolation_level=None)
     try:
         db.execute('PRAGMA busy_timeout=30000')
@@ -731,12 +802,19 @@ def vector_blob(vector):
     return np.asarray(vector,dtype='<f4').tobytes()
 
 
-def file_index(cfg):
+def root_key(path):
+    """A root as compared in the index: Windows paths ignore letter case."""
+    return os.path.normcase(str(path)) if IS_WINDOWS else str(path)
+
+
+def file_index(cfg,progress=None):
     kb=guard(cfg['kbFile'])
     if not kb.is_file():kb_connect(cfg)  # raises the fixed "run bootstrap" text
     lock=IndexLock(kb)
     if not lock.acquire():return {'status':'index-already-running'}
-    db=None;written=unchanged=skipped=0
+    db=None;written=unchanged=skipped=0;problems={}
+    def rollback():
+        if db.in_transaction:db.execute('ROLLBACK')
     try:
         db=kb_connect(cfg)
         reason=kb_schema_ok(db)
@@ -745,8 +823,8 @@ def file_index(cfg):
         qa_limit=int(os.environ.get('AGENTS_TOOLING_QA_MAX_FILES') or 0)
         broken=[]
         for source in cfg['roots']:
-            seen=[];root=str(Path(source['path']))
-            for count,path in enumerate(candidates(source['path'])):
+            seen=[];root=str(Path(source['path']));key=root_key(root)
+            for count,path in enumerate(candidates(source['path'],problems)):
                 if qa_limit and count>=qa_limit:break
                 logical_id='student:'+digest((str(path)+'\n'+source['project']).encode())
                 try:text=text_of(path)
@@ -757,14 +835,25 @@ def file_index(cfg):
                     except OSError:mark=None
                     if REPORTED_SKIPS.get(str(path))!=mark:
                         REPORTED_SKIPS[str(path)]=mark
-                        print(json.dumps({'status':'source-skipped','file':str(path),'reason':type(error).__name__},ensure_ascii=False),file=sys.stderr,flush=True)
+                        print(dump_json({'status':'source-skipped','file':str(path),'reason':type(error).__name__},ensure_ascii=False),file=sys.stderr,flush=True)
                     continue
                 if not text.strip():skipped+=1;continue
                 content_hash=digest(text.encode())
                 seen.append(logical_id)
                 source_id=logical_id+':'+content_hash
-                if db.execute("SELECT 1 FROM documents WHERE source_id=? AND status='active'",(source_id,)).fetchone():
-                    unchanged+=1;continue
+                row=db.execute('SELECT id,status FROM documents WHERE source_id=?',(source_id,)).fetchone()
+                if row and row[1]=='active':unchanged+=1;continue
+                if row:
+                    # The same content as an archived record (a reverted edit): it becomes
+                    # active again with its stored vectors; nothing is embedded anew.
+                    db.execute('BEGIN IMMEDIATE')
+                    try:
+                        db.execute(f"UPDATE documents SET status='archived',updated_at={NOW} WHERE logical_id=? AND status='active'",(logical_id,))
+                        db.execute(f"UPDATE documents SET status='active',updated_at={NOW} WHERE id=?",(row[0],))
+                        db.execute('COMMIT');written+=1
+                    except BaseException:rollback();raise
+                    if progress:progress({'status':'reactivated','file':str(path),'documentsWritten':written})
+                    continue
                 pieces=chunks(text)
                 vectors=[]
                 for offset in range(0,len(pieces),8):vectors+=embed(cfg,pieces[offset:offset+8])
@@ -774,24 +863,19 @@ def file_index(cfg):
                 db.execute('BEGIN IMMEDIATE')
                 try:
                     db.execute(f"UPDATE documents SET status='archived',updated_at={NOW} WHERE logical_id=? AND status='active'",(logical_id,))
-                    row=db.execute('SELECT id FROM documents WHERE source_id=?',(source_id,)).fetchone()
-                    if row:
-                        # The same content again (a reverted edit): its old record becomes active.
-                        document_id=row[0]
-                        db.execute(f"UPDATE documents SET status='active',updated_at={NOW} WHERE id=?",(document_id,))
-                    else:
-                        document_id=db.execute("""INSERT INTO documents
-                          (source_id,source_kind,source_path,title,agents,scopes,source_hash,content,metadata,logical_id,project,root)
-                          VALUES (?,'student-file',?,?,?,?,?,?,?,?,?,?)""",
-                          (source_id,str(path),path.name,json.dumps(labels),json.dumps([source['project']]),content_hash,
-                           text,meta,logical_id,source['project'],root)).lastrowid
-                        db.executemany('INSERT OR IGNORE INTO document_agents(document_id,agent) VALUES (?,?)',
-                                       [(document_id,label) for label in labels])
+                    document_id=db.execute("""INSERT INTO documents
+                      (source_id,source_kind,source_path,title,agents,scopes,source_hash,content,metadata,logical_id,project,root)
+                      VALUES (?,'student-file',?,?,?,?,?,?,?,?,?,?)""",
+                      (source_id,str(path),path.name,json.dumps(labels),json.dumps([source['project']]),content_hash,
+                       text,meta,logical_id,source['project'],key)).lastrowid
+                    db.executemany('INSERT OR IGNORE INTO document_agents(document_id,agent) VALUES (?,?)',
+                                   [(document_id,label) for label in labels])
                     db.executemany("""INSERT INTO chunks(document_id,chunk_index,content,content_hash,embedding_model,embedding)
                       VALUES (?,?,?,?,'bge-m3',?) ON CONFLICT(document_id,chunk_index) DO NOTHING""",
                       [(document_id,i,piece,digest(piece.encode()),vector_blob(vector)) for i,(piece,vector) in enumerate(zip(pieces,vectors))])
                     db.execute('COMMIT');written+=1
-                except BaseException:db.execute('ROLLBACK');raise
+                except BaseException:rollback();raise
+                if progress:progress({'status':'indexed','file':str(path),'chunks':len(pieces),'documentsWritten':written,'unchanged':unchanged})
             # Soft archive removed/now-excluded source records, never source files.
             db.execute('BEGIN IMMEDIATE')
             try:
@@ -800,10 +884,12 @@ def file_index(cfg):
                 db.executemany('INSERT OR IGNORE INTO seen_logical(logical_id) VALUES (?)',[(x,) for x in seen])
                 db.execute(f"""UPDATE documents SET status='archived',updated_at={NOW}
                   WHERE source_kind='student-file' AND status='active' AND root=? AND project=?
-                    AND logical_id NOT IN (SELECT logical_id FROM seen_logical)""",(root,source['project']))
+                    AND logical_id NOT IN (SELECT logical_id FROM seen_logical)""",(key,source['project']))
                 db.execute('COMMIT')
-            except BaseException:db.execute('ROLLBACK');raise
-        return {'documentsWritten':written,'unchanged':unchanged,'skipped':skipped,'skippedFiles':broken}
+            except BaseException:rollback();raise
+        skipped+=sum(problems.values())
+        return {'documentsWritten':written,'unchanged':unchanged,'skipped':skipped,'skippedFiles':broken,
+                'skippedReasons':dict(sorted(problems.items()))}
     finally:
         if db is not None:db.close()
         lock.release()
@@ -828,7 +914,8 @@ def file_search(cfg,query,profile,project,limit):
         rows=db.execute('SELECT c.id,c.embedding FROM chunks c JOIN documents d ON d.id=c.document_id WHERE '+scope,args).fetchall()
         semantic=[]
         if rows:
-            matrix=np.frombuffer(b''.join(r[1] for r in rows),dtype='<f4').reshape(len(rows),1024)
+            matrix=np.empty((len(rows),1024),dtype='<f4')
+            for i,r in enumerate(rows):matrix[i]=np.frombuffer(r[1],dtype='<f4')
             norms=np.linalg.norm(matrix,axis=1)*float(np.linalg.norm(vector))
             with np.errstate(divide='ignore',invalid='ignore'):scores=np.where(norms>0,(matrix@vector)/norms,-np.inf)
             semantic=[rows[i][0] for i in np.argsort(-scores,kind='stable')[:24]]
@@ -875,22 +962,21 @@ def file_doctor(cfg):
             'embeddingDimensions':len(vector),'local':True,'warnings':warnings}
 
 
-def index_with_status(cfg,status_file):
+def index_with_status(cfg,status_file,progress=None):
     """index() for the scheduled task: the last result goes to one small JSON file (bounded log)."""
     status_file=guard(status_file)
     def write(body):
         stage=status_file.with_name('.'+status_file.name+'.'+uuid.uuid4().hex[:8])
         stage.write_text(json.dumps({'finishedAt':time.strftime('%Y-%m-%dT%H:%M:%S%z'),**body},ensure_ascii=False),encoding='utf-8')
         os.replace(stage,status_file)
-    try:result=index(cfg)
+    try:result=file_index(cfg,progress) if cfg.get('backend')=='file' else index(cfg)
     except StudentFacingError as error:write({'status':'index-failed','errorClass':'StudentFacingError','message':str(error)});raise
     except Exception as error:write({'status':'index-pending','errorClass':type(error).__name__});raise
     write({'status':'ok',**result});return result
 
 
-def task_xml(command,arguments,interval_minutes,user=None):
+def task_xml(command,arguments,interval_minutes):
     from xml.sax.saxutils import escape
-    principal=f'<UserId>{escape(user)}</UserId>' if user else ''
     return f'''<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo><Description>Agents tooling: refresh the local knowledge base index</Description></RegistrationInfo>
@@ -902,7 +988,7 @@ def task_xml(command,arguments,interval_minutes,user=None):
     </TimeTrigger>
   </Triggers>
   <Principals>
-    <Principal id="Author">{principal}<LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal>
+    <Principal id="Author"><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal>
   </Principals>
   <Settings>
     <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
@@ -920,6 +1006,19 @@ def task_xml(command,arguments,interval_minutes,user=None):
 '''
 
 
+def index_task_name(user=None):
+    """AgentsTooling-KB-Index-<user>: one task per Windows user, an ASCII name in any case."""
+    user=os.environ.get('USERNAME','') if user is None else user
+    clean=re.sub(r'[^A-Za-z0-9_-]','_',user)[:40].strip('_')
+    if clean!=user or not clean:clean=(clean+'-' if clean else '')+digest(user.encode('utf-8'))[:8]
+    return INDEX_TASK_NAME+'-'+clean
+
+
+def schtasks(run,*args):
+    # No stdin: nothing started from here may touch the caller's console or pipe.
+    return run(['schtasks',*args],capture_output=True,stdin=subprocess.DEVNULL)
+
+
 def schedule_index(settings,interval_minutes=5,python=None,run=subprocess.run,windows=None):
     """Windows: a scheduled task of this user (no administrator) runs `index` every N minutes.
 
@@ -930,30 +1029,29 @@ def schedule_index(settings,interval_minutes=5,python=None,run=subprocess.run,wi
                                  'с watch (LaunchAgent/systemd), см. раздел 5.')
     if not isinstance(interval_minutes,int) or not 1<=interval_minutes<=1440:
         raise StudentFacingError('Интервал обновления индекса — от 1 до 1440 минут (не чаще раза в минуту).')
-    settings=guard(settings)
+    settings=guard(settings);task=index_task_name()
     # pythonw.exe of this venv: no console window pops up every few minutes.
     python=Path(python) if python else Path(sys.executable).with_name('pythonw.exe')
     if not python.is_file():raise StudentFacingError('Рядом с python.exe этого venv нет pythonw.exe; создай venv официальным Python.')
     status=settings.parent/'index-status.json'
+    # list2cmdline: quoted the way pythonw parses its command line (spaces, Cyrillic).
     arguments=subprocess.list2cmdline(['-B',str(Path(__file__).resolve()),'--config',str(settings),'index','--status-file',str(status)])
-    user=os.environ.get('USERNAME')
-    if user and os.environ.get('USERDOMAIN'):user=os.environ['USERDOMAIN']+'\\'+user
-    xml=task_xml(str(python),arguments,interval_minutes,user)
+    xml=task_xml(str(python),arguments,interval_minutes)
     state=settings.parent/'index-task.json'
-    desired={'task':INDEX_TASK_NAME,'definitionSha256':digest(xml.encode('utf-8'))}
-    exists=run(['schtasks','/Query','/TN',INDEX_TASK_NAME],capture_output=True).returncode==0
+    desired={'task':task,'definitionSha256':digest(xml.encode('utf-8'))}
+    exists=schtasks(run,'/Query','/TN',task).returncode==0
     try:current=json.loads(state.read_text(encoding='utf-8')) if state.is_file() else None
     except ValueError:current=None
-    result={'task':INDEX_TASK_NAME,'intervalMinutes':interval_minutes,'statusFile':str(status)}
+    result={'task':task,'intervalMinutes':interval_minutes,'statusFile':str(status)}
     if exists and current==desired:return {'changed':False,**result}
     definition=settings.parent/('.index-task-'+uuid.uuid4().hex[:8]+'.xml')
     try:
         definition.write_bytes(xml.encode('utf-16'))
-        created=run(['schtasks','/Create','/TN',INDEX_TASK_NAME,'/XML',str(definition),'/F'],capture_output=True)
+        created=schtasks(run,'/Create','/TN',task,'/XML',str(definition),'/F')
     finally:
         if definition.exists():definition.unlink()
     if created.returncode:
-        raise StudentFacingError(f'schtasks не создал задачу {INDEX_TASK_NAME} (код {created.returncode}). '
+        raise StudentFacingError(f'schtasks не создал задачу {task} (код {created.returncode}). '
                                  'Права администратора не нужны: запусти от пользователя, от которого работают агенты.')
     stage=state.with_name('.'+state.name+'.'+uuid.uuid4().hex[:8]);stage.write_text(json.dumps(desired),encoding='utf-8');os.replace(stage,state)
     return {'changed':True,**result}
@@ -961,12 +1059,13 @@ def schedule_index(settings,interval_minutes=5,python=None,run=subprocess.run,wi
 
 def unschedule_index(settings,run=subprocess.run,windows=None):
     if not (IS_WINDOWS if windows is None else windows):raise StudentFacingError('unschedule-index — только для Windows.')
-    settings=guard(settings);state=settings.parent/'index-task.json'
-    exists=run(['schtasks','/Query','/TN',INDEX_TASK_NAME],capture_output=True).returncode==0
-    if exists and run(['schtasks','/Delete','/TN',INDEX_TASK_NAME,'/F'],capture_output=True).returncode:
-        raise StudentFacingError('schtasks не удалил задачу '+INDEX_TASK_NAME+'.')
+    settings=guard(settings);state=settings.parent/'index-task.json';task=index_task_name()
+    exists=schtasks(run,'/Query','/TN',task).returncode==0
+    if exists:
+        schtasks(run,'/End','/TN',task)  # a running index is stopped first; "not running" is fine
+        if schtasks(run,'/Delete','/TN',task,'/F').returncode:raise StudentFacingError('schtasks не удалил задачу '+task+'.')
     if state.is_file():state.unlink()
-    return {'changed':exists,'task':INDEX_TASK_NAME}
+    return {'changed':exists,'task':task}
 
 
 def launch_mcp(argv,env,windows=None):
@@ -1005,6 +1104,8 @@ def vault_env(cfg):
 def vault_run(cfg,command):
     if not command:raise ValueError('A consuming command is required')
     env,sensitive=vault_env(cfg)
+    # Windows: this parent stays alive next to the child; it keeps no bootstrap token either.
+    if IS_WINDOWS:os.environ.pop('BWS_ACCESS_TOKEN',None)
     result=subprocess.run(command,env=env,capture_output=True)
     for data,target in [(result.stdout,sys.stdout),(result.stderr,sys.stderr)]:
         text=data[-32768:].decode('utf8',errors='replace')
@@ -1032,16 +1133,88 @@ def transcribe(model,audio,output):
     return {'local':True,'segments':len(result['segments']),'output':str(output)}
 
 
+def qa_keep_alive():
+    """Test-only idle time before the model is freed; honoured only with the other QA knobs."""
+    if not os.environ.get('AGENTS_TOOLING_QA_MAX_FILES'):return None
+    try:value=int(os.environ.get('AGENTS_TOOLING_QA_KEEPALIVE_SECONDS') or 0)
+    except ValueError:return None
+    return value if value>0 else None
+
+
+def preload_native_libraries():
+    """Windows, backend file: load every native library of a search before the server reads stdin.
+
+    A DLL with its own C runtime (numpy's OpenBLAS uses msvcrt.dll) asks GetFileType about the
+    std handles while it initializes. On a pipe with a pending synchronous ReadFile (the MCP
+    reader thread) that call blocks until the read completes: the first tool call deadlocks
+    (bpo-34780, bpo-39345). The 2.3 GB model itself is NOT loaded here: each agent has its
+    own MCP server, the model loads on the first search.
+    """
+    import sqlite3
+    import numpy
+    import onnxruntime
+    from tokenizers import Tokenizer  # noqa: F401
+    platform.system();platform.machine();platform.release()
+    onnxruntime.get_available_providers()
+    numpy.linalg.norm(numpy.ones(4,dtype=numpy.float32)@numpy.ones((4,4),dtype=numpy.float32))
+    sqlite3.connect(':memory:').close()
+
+
+def detach_std_input():
+    """Windows: serve MCP from a private duplicate of the stdin pipe; the std handle becomes NUL.
+
+    DLLs loaded later (an InferenceSession re-created after the keep-alive release) and any
+    child process then see NUL, never the pipe with the pending read.
+    """
+    import ctypes
+    import io
+    import msvcrt
+    from ctypes import wintypes
+    import anyio
+    private=os.dup(0)
+    nul=os.open(os.devnull,os.O_RDONLY)
+    os.dup2(nul,0)
+    if nul!=0:os.close(nul)
+    kernel32=ctypes.WinDLL('kernel32',use_last_error=True)
+    kernel32.SetStdHandle.argtypes=[wintypes.DWORD,wintypes.HANDLE];kernel32.SetStdHandle.restype=wintypes.BOOL
+    if not kernel32.SetStdHandle(wintypes.DWORD(-10&0xFFFFFFFF),wintypes.HANDLE(msvcrt.get_osfhandle(0))):  # STD_INPUT_HANDLE
+        raise OSError('SetStdHandle failed')
+    return anyio.wrap_file(io.TextIOWrapper(open(private,'rb',closefd=True),encoding='utf-8',errors='replace'))
+
+
+def run_stdio(server,stdin):
+    """FastMCP.run(transport='stdio') with our own stdin (FastMCP.run takes none)."""
+    import anyio
+    from mcp.server.stdio import stdio_server
+    async def session():
+        async with stdio_server(stdin=stdin,stdout=None) as (read_stream,write_stream):
+            await server._mcp_server.run(read_stream,write_stream,server._mcp_server.create_initialization_options())
+    anyio.run(session)
+
+
+_QA_STACKS=[]
+
+
 def serve(cfg):
     from mcp.server.fastmcp import FastMCP
     # backend file: the in-process model is freed after an idle pause, like Ollama's keep_alive.
-    if cfg.get('backend')=='file':_ENGINE['keepAlive']=EMBED_KEEP_ALIVE_SECONDS
+    if cfg.get('backend')=='file':_ENGINE['keepAlive']=qa_keep_alive() or EMBED_KEEP_ALIVE_SECONDS
+    stacks=os.environ.get('AGENTS_TOOLING_QA_STACKS')
+    if stacks:
+        # Test-only: a hung server leaves the stacks of all its threads here every 240 s.
+        import faulthandler
+        _QA_STACKS.append(open(stacks,'w',encoding='utf-8'))
+        faulthandler.dump_traceback_later(240,repeat=True,file=_QA_STACKS[-1])
     server=FastMCP('student-agent-kb')
     @server.tool()
     def agent_kb_search(query:str,profile:str='tech',project:str='__skills__',limit:int=6)->dict:
         """Search this student's indexed skills or one registered project. No writes."""
         try:return search(cfg,query,profile,project,limit)
         except Exception as e:return {'error':type(e).__name__,'message':'Check local KB services; no raw credentials/logs returned.'}
+    if IS_WINDOWS and cfg.get('backend')=='file':
+        preload_native_libraries()
+        run_stdio(server,detach_std_input())
+        return
     server.run(transport='stdio')
 
 
@@ -1049,6 +1222,7 @@ def main():
     p=argparse.ArgumentParser();p.add_argument('--config',type=Path,default=Path(__file__).with_name('settings.json'))
     sub=p.add_subparsers(dest='command',required=True)
     i=sub.add_parser('index');i.add_argument('--status-file',type=Path)
+    i.add_argument('--progress',action='store_true',help='backend file: one JSON line per indexed document on stderr')
     sub.add_parser('mcp');sub.add_parser('doctor')
     sub.add_parser('vault-mcp')
     w=sub.add_parser('watch');w.add_argument('--interval',type=int,default=300)
@@ -1065,22 +1239,31 @@ def main():
         # A console or pipe in a legacy code page must not crash on text it cannot show.
         for stream in (sys.stdout,sys.stderr):
             if stream is not None and hasattr(stream,'reconfigure'):stream.reconfigure(errors='backslashreplace')
-    if a.command=='transcribe':print(json.dumps(transcribe(a.model_dir,a.audio,a.output),ensure_ascii=False));return
-    if a.command=='fetch-whisper-model':print(json.dumps(fetch_whisper_model(a.model_dir),ensure_ascii=False));return
-    if a.command=='fetch-embedding-model':print(json.dumps(fetch_embedding_model(a.model_dir),ensure_ascii=False));return
+        if windows_native_arm64():raise StudentFacingError(ARM_REFUSAL)
+    if a.command=='transcribe':print(dump_json(transcribe(a.model_dir,a.audio,a.output),ensure_ascii=False));return
+    if a.command=='fetch-whisper-model':print(dump_json(fetch_whisper_model(a.model_dir),ensure_ascii=False));return
+    if a.command=='fetch-embedding-model':print(dump_json(fetch_embedding_model(a.model_dir),ensure_ascii=False));return
     cfg=config(a.config)
-    if a.command=='model-check':print(json.dumps(model_check(cfg)));return
-    if a.command=='index':print(json.dumps(index_with_status(cfg,a.status_file) if a.status_file else index(cfg)))
-    elif a.command=='doctor':print(json.dumps(doctor(cfg)))
-    elif a.command=='search':print(json.dumps(search(cfg,a.query,a.profile,a.project),ensure_ascii=False))
+    if a.command=='model-check':print(dump_json(model_check(cfg)));return
+    if a.command=='index':
+        progress=None
+        if a.progress and cfg.get('backend')=='file':
+            progress=lambda event:print(dump_json(event,ensure_ascii=False),file=sys.stderr,flush=True)
+        if a.status_file:result=index_with_status(cfg,a.status_file,progress)
+        else:result=file_index(cfg,progress) if progress else index(cfg)
+        print(dump_json(result))
+    elif a.command=='doctor':print(dump_json(doctor(cfg)))
+    elif a.command=='search':print(dump_json(search(cfg,a.query,a.profile,a.project),ensure_ascii=False))
     elif a.command=='mcp':serve(cfg)
     elif a.command=='vault-mcp':
         # A fixed trusted MCP entrypoint needs live stdio, never capture/buffer it.
         env,_=vault_env(cfg)
+        # Windows: this parent waits next to the server; it keeps no bootstrap token either.
+        if IS_WINDOWS:os.environ.pop('BWS_ACCESS_TOKEN',None)
         sys.exit(launch_mcp([sys.executable,'-B',str(Path(__file__).resolve()),'--config',str(a.config.absolute()),'mcp'],env))
     elif a.command=='vault-run':sys.exit(vault_run(cfg,a.args[1:] if a.args[:1]==['--'] else a.args))
-    elif a.command=='schedule-index':print(json.dumps(schedule_index(a.config,a.interval_minutes),ensure_ascii=False))
-    elif a.command=='unschedule-index':print(json.dumps(unschedule_index(a.config),ensure_ascii=False))
+    elif a.command=='schedule-index':print(dump_json(schedule_index(a.config,a.interval_minutes),ensure_ascii=False))
+    elif a.command=='unschedule-index':print(dump_json(unschedule_index(a.config),ensure_ascii=False))
     elif a.command=='watch':
         if IS_WINDOWS:
             raise StudentFacingError('На Windows постоянный процесс watch не используется: индекс обновляет '
@@ -1088,7 +1271,7 @@ def main():
         if a.interval<60:raise ValueError('Polling must not run more than once a minute')
         while True:
             try:index(cfg)
-            except Exception as error:print(json.dumps({'status':'index-pending','errorClass':type(error).__name__}),flush=True)
+            except Exception as error:print(dump_json({'status':'index-pending','errorClass':type(error).__name__}),flush=True)
             time.sleep(a.interval)
 
 
@@ -1096,9 +1279,9 @@ if __name__=='__main__':
     try:main()
     except StudentFacingError as error:
         # Our own fixed texts (pins, retries): safe and meant for the student.
-        print(json.dumps({'status':'failed','errorClass':'StudentFacingError','message':str(error)},ensure_ascii=False),file=sys.stderr)
+        print(dump_json({'status':'failed','errorClass':'StudentFacingError','message':str(error)},ensure_ascii=False),file=sys.stderr)
         sys.exit(2)
     except Exception as error:
         # Unknown libraries can embed DSNs or secret values in exception strings.
-        print(json.dumps({'status':'failed','errorClass':type(error).__name__,'message':'Check the local setup and service status; raw error suppressed.'}),file=sys.stderr)
+        print(dump_json({'status':'failed','errorClass':type(error).__name__,'message':'Check the local setup and service status; raw error suppressed.'}),file=sys.stderr)
         sys.exit(1)

@@ -27,7 +27,43 @@ PASS={'PATH','SYSTEMROOT','WINDIR','COMSPEC','TEMP','TMP','LOCALAPPDATA','APPDAT
       'AGENTS_TOOLING_QA_MAX_FILES','AGENTS_TOOLING_QA_KEEPALIVE_SECONDS','AGENTS_TOOLING_QA_STACKS'}
 
 
+def child_pids():
+    """Windows: PIDs whose parent is this process (the server, or the vault-mcp style launcher)."""
+    import ctypes
+    from ctypes import wintypes
+    class Entry(ctypes.Structure):
+        _fields_=[('dwSize',wintypes.DWORD),('cntUsage',wintypes.DWORD),('th32ProcessID',wintypes.DWORD),
+                  ('th32DefaultHeapID',ctypes.c_size_t),('th32ModuleID',wintypes.DWORD),('cntThreads',wintypes.DWORD),
+                  ('th32ParentProcessID',wintypes.DWORD),('pcPriClassBase',wintypes.LONG),('dwFlags',wintypes.DWORD),
+                  ('szExeFile',wintypes.WCHAR*260)]
+    kernel32=ctypes.WinDLL('kernel32',use_last_error=True)
+    kernel32.CreateToolhelp32Snapshot.argtypes=[wintypes.DWORD,wintypes.DWORD];kernel32.CreateToolhelp32Snapshot.restype=wintypes.HANDLE
+    for name in ('Process32FirstW','Process32NextW'):
+        getattr(kernel32,name).argtypes=[wintypes.HANDLE,ctypes.POINTER(Entry)];getattr(kernel32,name).restype=wintypes.BOOL
+    kernel32.CloseHandle.argtypes=[wintypes.HANDLE]
+    snapshot=kernel32.CreateToolhelp32Snapshot(0x2,0)  # TH32CS_SNAPPROCESS
+    entry=Entry();entry.dwSize=ctypes.sizeof(Entry);found=[]
+    try:
+        more=kernel32.Process32FirstW(snapshot,ctypes.byref(entry))
+        while more:
+            if entry.th32ParentProcessID==os.getpid():found.append(entry.th32ProcessID)
+            more=kernel32.Process32NextW(snapshot,ctypes.byref(entry))
+    finally:kernel32.CloseHandle(snapshot)
+    return found
+
+
+def kill_children():
+    """A hung session must not outlive this check: end each child with its whole tree."""
+    if os.name!='nt':return
+    import subprocess
+    try:
+        for pid in child_pids():
+            subprocess.run(['taskkill','/T','/F','/PID',str(pid)],capture_output=True,stdin=subprocess.DEVNULL,timeout=30)
+    except Exception:pass  # the exit below happens in any case
+
+
 def report(body,code):
+    if code==3:kill_children()
     print(json.dumps(body,ensure_ascii=True),flush=True)
     os._exit(code)  # no interpreter shutdown that could wait on a stuck child or thread
 

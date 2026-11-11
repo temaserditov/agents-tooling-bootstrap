@@ -56,9 +56,11 @@ def ours(entry):
 
 
 def reparse_point(path):
+    """Windows: a symlink, junction or mount point (name-surrogate reparse tag). OneDrive
+    placeholders, dedup and compressed files are reparse points too, but ordinary files."""
     try:st=os.lstat(path)
     except OSError:return False
-    return bool(getattr(st,'st_file_attributes',0)&0x400)  # FILE_ATTRIBUTE_REPARSE_POINT: junctions too
+    return bool(getattr(st,'st_file_attributes',0)&0x400) and bool(getattr(st,'st_reparse_tag',0)&0x20000000)
 
 
 def safe(path):

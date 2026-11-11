@@ -69,6 +69,12 @@ SECRET_NAMES={'.env','auth.json','credentials','secrets','cookies','.ssh','.gnup
               'id_rsa','id_dsa','id_ecdsa','id_ed25519'}
 SECRET_SUFFIXES=('.pem','.key','.p12','.pfx','.kdbx')
 FILE_ATTRIBUTE_REPARSE_POINT=0x400
+FILE_ATTRIBUTE_OFFLINE=0x1000
+FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS=0x400000
+# Name-surrogate reparse tags point elsewhere (symlinks 0xA000000C, junctions/mount points
+# 0xA0000003). Other reparse points are ordinary files: OneDrive placeholders (0x9000001A
+# and the other cloud tags), dedup (0x80000013), WOF compression, AppExecLinks.
+IO_REPARSE_TAG_NAME_SURROGATE=0x20000000
 
 
 def dump_json(value,ensure_ascii=True,**kw):
@@ -85,11 +91,24 @@ def settings_text(path):
     return data.decode('utf-8-sig')
 
 
-def reparse_point(path):
-    """Windows: a junction, a symlink or another reparse point (never followed)."""
+def win_attributes(path):
+    """Windows: (file attributes, reparse tag) of the path itself, never of a link target."""
     try:st=os.lstat(path)
-    except OSError:return False
-    return bool(getattr(st,'st_file_attributes',0)&FILE_ATTRIBUTE_REPARSE_POINT)
+    except OSError:return 0,0
+    return getattr(st,'st_file_attributes',0),getattr(st,'st_reparse_tag',0)
+
+
+def reparse_point(path):
+    """Windows: a symlink, junction or mount point (a name surrogate): never followed."""
+    attributes,tag=win_attributes(path)
+    return bool(attributes&FILE_ATTRIBUTE_REPARSE_POINT) and bool(tag&IO_REPARSE_TAG_NAME_SURROGATE)
+
+
+def cloud_only(path):
+    """Windows: a cloud placeholder whose content is not on this disk (OneDrive Files On-Demand).
+    Reading it would download it; the index skips it instead."""
+    attributes,_=win_attributes(path)
+    return bool(attributes&(FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS|FILE_ATTRIBUTE_OFFLINE))
 
 
 def linked(path):
@@ -290,6 +309,9 @@ def candidates(root,problems=None):
             if path.suffix.lower() in {'.json','.yaml','.yml'} and re.match(r'(?i)(auth|cookies?|credentials?|tokens?|sessions?|secrets?)(?:[._-]|$)',name):continue
             try:
                 if linked(path):continue
+                if IS_WINDOWS and cloud_only(path):
+                    if problems is not None:problems['cloudOnly']=problems.get('cloudOnly',0)+1
+                    continue
                 st=path.stat()
             except OSError:
                 if problems is None:raise
@@ -972,7 +994,8 @@ def index_with_status(cfg,status_file,progress=None):
     try:result=file_index(cfg,progress) if cfg.get('backend')=='file' else index(cfg)
     except StudentFacingError as error:write({'status':'index-failed','errorClass':'StudentFacingError','message':str(error)});raise
     except Exception as error:write({'status':'index-pending','errorClass':type(error).__name__});raise
-    write({'status':'ok',**result});return result
+    # A run that did nothing (index-already-running) keeps its own status; only a real run is ok.
+    write({**result,'status':result.get('status','ok')});return result
 
 
 def task_xml(command,arguments,interval_minutes):

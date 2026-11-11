@@ -164,7 +164,7 @@ jobs:
             'print(r.stdout.strip());sys.exit(0 if json.loads(r.stdout)=={''status'':''index-already-running''} else 1)'
           ) -join "`n"
           Set-Content -LiteralPath "$env:RUNNER_TEMP\lock-check.py" -Encoding ascii -Value $code
-          & $py -B "$env:RUNNER_TEMP\lock-check.py" $s; if($LASTEXITCODE){throw 'a second index ran while the first held the lock'}
+          & $py -X utf8 -B "$env:RUNNER_TEMP\lock-check.py" $s; if($LASTEXITCODE){throw 'a second index ran while the first held the lock'}
           'TOOLING_IDEMPOTENT changed=false, blocks intact, Cyrillic config intact, lock holds'
       # Cyrillic text: PowerShell 7 reads the step as UTF-8.
       - name: Real stdio MCP call of agent_kb_search (direct, and through the vault-mcp launcher)
@@ -216,6 +216,13 @@ jobs:
             $deadline=(Get-Date).AddSeconds(180);while(-not (Test-Path -LiteralPath $status) -and (Get-Date) -lt $deadline){Start-Sleep 3}
             $observed=Test-Path -LiteralPath $status;$direct='not-needed'
             if(-not $observed){
+              # A StartWhenAvailable instance may still be running: let it finish first, or the
+              # direct run below would only get index-already-running.
+              $deadline=(Get-Date).AddSeconds(120)
+              while(((& schtasks.exe /Query /TN $task /FO CSV /NH | Out-String) -match '"Running"') -and (Get-Date) -lt $deadline){Start-Sleep 3}
+              $observed=Test-Path -LiteralPath $status
+            }
+            if(-not $observed){
               # The runner session may not start interactive-logon tasks: run exactly the
               # registered command line once, without the scheduler, and say so.
               $p=Start-Process -FilePath $cmd -ArgumentList $arguments -WorkingDirectory $t -Wait -PassThru -WindowStyle Hidden
@@ -259,10 +266,14 @@ jobs:
             'print(''NET_PROBE reached=%d''%reached);sys.exit(reached)'
           ) -join "`n"
           Set-Content -LiteralPath "$env:RUNNER_TEMP\net-probe.py" -Encoding ascii -Value $probe
-          & $py -B "$env:RUNNER_TEMP\net-probe.py"; if($LASTEXITCODE -eq 0){throw 'the probe cannot reach huggingface.co even before the block: the offline check would prove nothing'}
+          & $py -X utf8 -B "$env:RUNNER_TEMP\net-probe.py"; if($LASTEXITCODE -eq 0){throw 'the probe cannot reach huggingface.co even before the block: the offline check would prove nothing'}
           $ips=@([Net.Dns]::GetHostAddresses('huggingface.co')|ForEach-Object{$_.IPAddressToString})
           $hosts="$env:SystemRoot\System32\drivers\etc\hosts";$hostsBefore=[IO.File]::ReadAllBytes($hosts)
-          $exes=@(& $py -c "import sys;print(sys.executable);print(sys._base_executable)")|ForEach-Object{$_.Trim()}|Where-Object{$_}|Sort-Object -Unique
+          # -X utf8: the venv path is Cyrillic and a pipe is cp1252 here; without it print() fails
+          # and no per-interpreter rule would be created (a silent partial block).
+          $exes=@(& $py -X utf8 -c "import sys;print(sys.executable);print(sys._base_executable)")|ForEach-Object{$_.Trim()}|Where-Object{$_}|Sort-Object -Unique
+          if($exes.Count -lt 2){throw "interpreters to block not found: $($exes -join ';')"}
+          foreach($e in $exes){if(-not (Test-Path -LiteralPath $e)){throw "interpreter path garbled: $e"}}
           $saved=@{};foreach($k in 'HTTPS_PROXY','HTTP_PROXY','ALL_PROXY','NO_PROXY'){$saved[$k]=[Environment]::GetEnvironmentVariable($k)}
           $i=0
           try{
@@ -271,7 +282,7 @@ jobs:
             [IO.File]::AppendAllText($hosts,"`r`n0.0.0.0 huggingface.co`r`n:: huggingface.co`r`n",[Text.Encoding]::ASCII)
             Clear-DnsClientCache
             $env:HTTPS_PROXY='http://127.0.0.1:9';$env:HTTP_PROXY='http://127.0.0.1:9';$env:ALL_PROXY='http://127.0.0.1:9';$env:NO_PROXY=''
-            & $py -B "$env:RUNNER_TEMP\net-probe.py"; if($LASTEXITCODE -ne 0){throw "OFFLINE_NOT_ENFORCED: the interpreter still reaches huggingface.co (reached=$LASTEXITCODE)"}
+            & $py -X utf8 -B "$env:RUNNER_TEMP\net-probe.py"; if($LASTEXITCODE -ne 0){throw "OFFLINE_NOT_ENFORCED: the interpreter still reaches huggingface.co (reached=$LASTEXITCODE)"}
             'OFFLINE_ENFORCED (direct HTTPS and raw TCP both blocked)'
             $out=& $py -B student_tools.py transcribe --model-dir $m --audio tests\fixtures\ru-phrase.wav --output "$env:RUNNER_TEMP\asr.json" | Out-String
             if($LASTEXITCODE){throw "offline transcription failed: $out"}

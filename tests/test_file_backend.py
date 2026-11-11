@@ -144,6 +144,10 @@ class FileIndexAndSearch(unittest.TestCase):
 
     def test_status_file_of_the_scheduled_run(self):
         tools.ensure_kb_schema(self.cfg);status=self.root/'tooling/index-status.json';status.parent.mkdir()
+        held=tools.IndexLock(tools.guard(self.cfg['kbFile']));self.assertTrue(held.acquire())
+        try:tools.index_with_status(self.cfg,status)
+        finally:held.release()
+        self.assertEqual(json.loads(status.read_text(encoding='utf-8'))['status'],'index-already-running')  # never ok
         tools.index_with_status(self.cfg,status)
         body=json.loads(status.read_text(encoding='utf-8'))
         self.assertEqual(body['status'],'ok');self.assertEqual(body['documentsWritten'],3)
@@ -401,11 +405,33 @@ class SourceSafety(unittest.TestCase):
             self.assertTrue(tools.excluded_name('Config.YAML'));self.assertTrue(tools.excluded_name('Logs'))
         self.assertFalse(tools.excluded_name('Logs'))  # POSIX names keep their case, as before
 
-    def test_reparse_points_are_links_on_windows(self):
-        class St:st_file_attributes=0x400
-        with patch.object(tools,'IS_WINDOWS',True),patch.object(tools.os,'lstat',return_value=St()):
-            self.assertTrue(tools.linked(Path('/x/junction')))
-            with self.assertRaises(ValueError):tools.guard('/x/junction/file')
+    def test_only_name_surrogate_reparse_points_are_links_on_windows(self):
+        cases={'symlink':(0x400,0xA000000C,True),'mount point/junction':(0x400,0xA0000003,True),
+               'OneDrive placeholder':(0x400,0x9000001A,False),'dedup':(0x400,0x80000013,False),'plain':(0x20,0,False)}
+        for label,(attributes,tag,link) in cases.items():
+            with self.subTest(label),patch.object(tools,'IS_WINDOWS',True),patch.object(tools,'win_attributes',return_value=(attributes,tag)):
+                self.assertIs(tools.reparse_point('/x/item'),link)
+                if link:
+                    with self.assertRaises(ValueError):tools.guard('/x/item/file')
+                else:self.assertEqual(str(tools.guard('/x/item/file')),str(Path('/x/item/file').absolute()))
+        bootstrap=load('tooling_bootstrap_reparse','bootstrap.py')
+        class St:
+            def __init__(self,a,t):self.st_file_attributes=a;self.st_reparse_tag=t
+        for (a,t),link in {(0x400,0xA0000003):True,(0x400,0x9000001A):False,(0x400,0x80000013):False}.items():
+            with patch.object(bootstrap.os,'lstat',return_value=St(a,t)):self.assertIs(bootstrap.reparse_point('/x'),link)
+
+    def test_cloud_placeholders_are_indexed_only_when_on_disk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp).resolve()
+            for name in ('local.md','placeholder.md','offline.md','dedup.md'):(root/name).write_text('x',encoding='utf-8')
+            attributes={'placeholder.md':(0x400|0x400000,0x9000001A),'offline.md':(0x400|0x1000,0x9000001A),
+                        'local.md':(0x400,0x9000001A),'dedup.md':(0x400,0x80000013)}
+            def attrs(path):return attributes.get(Path(path).name,(0x10,0))
+            problems={}
+            with patch.object(tools,'IS_WINDOWS',True),patch.object(tools,'win_attributes',side_effect=attrs):
+                found=[p.name for p in tools.candidates(root,problems)]
+            self.assertEqual(found,['dedup.md','local.md'])  # never a mass download from OneDrive
+            self.assertEqual(problems,{'cloudOnly':2})
 
     def test_an_unreadable_file_is_counted_and_skipped(self):
         with tempfile.TemporaryDirectory() as tmp:

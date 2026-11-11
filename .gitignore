@@ -9,3 +9,9 @@ integration-backups/
 index-context/
 models/
 browser-profile*/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.index-lock
+index-status.json
+index-task.json

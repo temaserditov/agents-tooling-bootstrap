@@ -19,15 +19,21 @@ Telegram Reader исключён: не устанавливай/не переа�
    **v2026.11.10.3 или новее** (https://github.com/temaserditov/agents-repair-patch/releases/tag/v2026.11.10.3;
    более новый выпуск патча тоже подходит — не требуй именно .3; его задание:
    ремонт → штатное обновление → ремонт → verify), затем это дооснащение.
-2. `hermes --version` показывает **0.23.0** (commit `2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19`).
+2. `hermes --version` показывает **0.23.0** (commit `2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19`)
+   или **0.23.1** (её ставит патч агентов v2026.11.10.4; код пакета принимает её так же, как
+   0.23.0, но этот выпуск дооснащения проверялся на 0.23.0).
    Hermes 0.21–0.22 код пакета понимает, но этот выпуск проверялся на 0.23.0.
 3. Последний `repair.sh verify` / `repair.ps1 verify` патча завершился без красных пунктов.
 
 Если что-то из этого не так — не начинай дооснащение и не чини обновление сам:
 напиши мне, что нужно сначала выполнить патч агентов.
 
-Если агенты стоят на Windows (любой, x64 или ARM64) — ОСТАНОВИСЬ и скажи мне:
-этот выпуск дооснащения на Windows не поддерживается, ничего не устанавливай.
+Если агенты стоят на Windows x64 (официальный Hermes, Windows v3) — выполняй разделы 1–9
+с поправками раздела 10 «Windows x64»: там база знаний работает без PostgreSQL, Ollama и
+без служб. Раздел 10 главнее разделов 1–9 везде, где они расходятся.
+
+Если агенты стоят на Windows на ARM64 — ОСТАНОВИСЬ и скажи мне: на Windows ARM64
+дооснащение не поддерживается, ничего не устанавливай.
 Если Windows — только мой компьютер для работы с Ubuntu VPS, ставь всё на VPS.
 
 Повторный запуск патча или
@@ -42,7 +48,7 @@ Telegram Reader исключён: не устанавливай/не переа�
 | macOS 14–15, Apple Silicon | поддерживается; проверено в виртуальной машине (macOS 15) |
 | Ubuntu 24.04 VPS, x86_64/arm64 | поддерживается; проверено в виртуальной машине (Ubuntu 24.04) |
 | macOS на Intel | код тот же, отдельно не проверялся |
-| Windows 10/11 x64 (официальный Hermes, Windows v3) | не поддерживается в этом выпуске: нативная проверка на Windows x64 не завершена (дошла до установки PostgreSQL/pgvector и Ollama, проверка сервиса Ollama не прошла). Ставь дооснащение на Mac или Ubuntu VPS; на Windows — только по отдельному выпуску |
+| Windows 10/11 x64 (официальный Hermes, Windows v3) | поддерживается по разделу 10 (база знаний — файл SQLite + bge-m3 через ONNX, без служб); проверено на GitHub windows-2025 — WINDOWS_STATUS: ОЖИДАЕТ CI |
 | Windows на ARM64 | НЕ поддерживается: ничего не ставь, скажи мне |
 | Windows → VPS | всё ставится на Ubuntu VPS, не на Windows клиента |
 
@@ -59,8 +65,8 @@ Hermes, не случайный системный. inventory ничего не 
 авторизацию. При нестандартном расположении Hermes передай `--hermes-home ABSOLUTE_PATH`.
 Не принимай отсутствие пакета в одном Python за его отсутствие во всей системе.
 
-Определи сценарий: Mac локально, Ubuntu VPS либо Windows→VPS (Windows локально в этом
-выпуске не поддерживается — см. раздел 0).
+Определи сценарий: Mac локально, Ubuntu VPS, Windows x64 локально (раздел 10) либо
+Windows→VPS (Windows ARM64 локально не поддерживается — см. раздел 0).
 В последнем случае всё ставится НА Ubuntu, а не на Windows клиента. Сверь ОС,
 архитектуру, свободное место, версию Hermes и существующие инструменты. Проверяй
 отдельные runtime Content. Исправные экземпляры переиспользуй.
@@ -453,3 +459,162 @@ GPU для всех навыков курса это может быть нес�
 данные моей переписки. Не называй этот пакет полностью протестированным на
 моём устройстве до реального выполнения. Ничего не отправляй автору курса
 автоматически и не меняй production-платформу.
+
+## 10. Windows x64 (официальный Hermes, Windows v3)
+
+Этот раздел — для агентов, которые стоят на самом Windows 10/11 x64. На Windows ARM64
+ничего не ставь (раздел 0). Если Windows — только мой компьютер для работы с VPS, этот
+раздел не нужен: всё ставится на Ubuntu.
+
+**Почему здесь по-другому.** На Windows НЕТ служб: не ставь PostgreSQL, pgvector, Ollama,
+WSL, Docker и не создавай службы Windows. Оболочка, в которой Codex выполняет команды,
+завершает запущенные из неё процессы — долгоживущий сервер (Ollama, `watch`) не переживёт
+шаг. Поэтому база знаний на Windows — backend `file`:
+
+- модель — та же bge-m3, 1024 измерения, но официальный ONNX-экспорт (`BAAI/bge-m3`,
+  ревизия `5617a9f61b028005a4858fdac845db406aefb181`, папка `onnx/`); векторы совпадают с
+  Ollama bge-m3 (косинус 0,99999). Она считается прямо в процессе `student_tools.py`
+  через onnxruntime на CPU, без сети и без сервера;
+- хранилище — один файл SQLite (`kbFile`): документы, фрагменты, векторы и полнотекстовый
+  индекс FTS5, режим WAL. Поиск тот же гибридный (векторы + слова, RRF), MCP тот же:
+  сервер `student-agent-kb`, инструмент `agent_kb_search` с теми же параметрами;
+- пароля и строки подключения нет совсем: settings.json с ними не принимается.
+
+Разделы 4 (PostgreSQL/Ollama) и часть раздела 5 (`watch`, LaunchAgent/systemd) на Windows не
+выполняются; их заменяют шаги ниже. Остальные правила разделов 1–9 (сохранность, секреты,
+профили, браузер, приёмка) действуют.
+
+**Место и память.** Модель bge-m3 (ONNX) — 2,3 ГБ (2 284 млн байт: `model.onnx_data`
+2 266 820 608 байт и мелкие файлы), Whisper small — около 0,5 ГБ, venv — около 0,5 ГБ, плюс
+сам Python и индекс (текст материалов и 4 КБ на каждый фрагмент). Итого без индекса —
+около 3,5 ГБ; назови мне точную оценку до установки. Во время индексации и поиска модель
+занимает в памяти около 3 ГБ; MCP-сервер освобождает её через 2 минуты простоя. Каждый
+профиль Hermes запускает свой MCP-процесс: одновременный поиск у нескольких агентов —
+кратно больше памяти. На компьютере меньше 8 ГБ ОЗУ предупреди меня.
+
+### 10.1. Подготовка
+
+Работай от моего пользователя Windows, НЕ от администратора. Hermes ищи в
+`%LOCALAPPDATA%\hermes` (inventory находит его сам). Рабочая папка пакета —
+`%USERPROFILE%\InfobizAgents\tooling` (дальше `TOOLING`), пакет распакуй в неё по шапке
+задания. Нужен официальный Python 3.11–3.13 x64 с python.org (в нём есть SQLite с FTS5 и
+`pythonw.exe`); Python из Microsoft Store и MSYS не используй.
+
+```powershell
+py -3.12 -m venv TOOLING\venv
+TOOLING\venv\Scripts\python.exe -m pip install --require-hashes -r requirements.lock
+TOOLING\venv\Scripts\python.exe -m pip install --require-hashes -r requirements-whisper.lock
+TOOLING\venv\Scripts\python.exe -m pip check
+TOOLING\venv\Scripts\python.exe -B inventory.py
+```
+
+На Windows ОБА lock-файла ставятся в ОДИН venv: в requirements-whisper.lock лежат
+onnxruntime, tokenizers и numpy, без которых база знаний не работает (и faster-whisper).
+Дальше `PY` — это `TOOLING\venv\Scripts\python.exe`, `SETTINGS` — `TOOLING\settings.json`
+(в PowerShell вызывай `& "ПОЛНЫЙ_ПУТЬ\python.exe" ...`).
+
+settings.json сделай по образцу `settings.windows.example.json`: `"backend": "file"`,
+`kbFile` — например `TOOLING\kb\agents-student-kb.sqlite`, `embeddingModelDir` — например
+`TOOLING\models\bge-m3-onnx`, `embeddingRevision` — как в образце. Пути абсолютные, с моим
+настоящим именем пользователя. Раздела `database`, `ollamaUrl`, паролей и токенов в нём нет.
+
+### 10.2. Модель bge-m3 (ONNX) и проверка
+
+```powershell
+PY -B student_tools.py fetch-embedding-model --model-dir TOOLING\models\bge-m3-onnx
+PY -B student_tools.py fetch-embedding-model --model-dir TOOLING\models\bge-m3-onnx
+PY -B student_tools.py --config SETTINGS model-check
+PY -B student_tools.py --config SETTINGS doctor
+```
+
+fetch-embedding-model качает только из `huggingface.co/BAAI/bge-m3` закреплённой ревизии
+(без входа, без зеркал), проверяет размер и SHA-256 каждого файла и только потом публикует
+папку; оборванную загрузку продолжает, при 5xx/таймауте ограниченно повторяет. Второй
+запуск должен ответить `"changed": false`. Несовпадение SHA-256 — ЖЁСТКИЙ ОТКАЗ: модель не
+устанавливается, не продолжай с другой моделью, скажи мне. model-check сверяет SHA-256
+всех файлов; doctor — файлы модели, FTS5, схему базы (до bootstrap — `pending-bootstrap`),
+тестовый вектор 1024 и `local: true`.
+
+### 10.3. Подключение к агентам и первая индексация
+
+```powershell
+PY -B bootstrap.py --hermes-home $env:LOCALAPPDATA\hermes --settings SETTINGS --inspect
+PY -B bootstrap.py --hermes-home $env:LOCALAPPDATA\hermes --settings SETTINGS --index
+PY -B student_tools.py --config SETTINGS search "запрос по-русски" --profile tech --project __skills__
+PY -B bootstrap.py --hermes-home $env:LOCALAPPDATA\hermes --settings SETTINGS --index
+```
+
+bootstrap сам создаёт схему базы в `kbFile` (`kbSchemaCreated: true`); psql, schema.sql и
+grants.sql на Windows не нужны. Регистрация MCP в config.yaml каждого профиля и блок
+`agents-student-tooling` в AGENTS.md/SOUL.md — как в разделе 4. Повторный запуск должен
+дать `"changed": false` и `changedFiles: 0`. MCP-клиент Hermes — как в разделе 4: при
+`hermesMcpClient: false` выполни `hermes pm install --extra mcp`, затем для каждого профиля
+`$env:HERMES_HOME="$env:LOCALAPPDATA\hermes\profiles\ПРОФИЛЬ"; hermes mcp test student-agent-kb`
+(должно быть `Tools discovered: 1`) и реальный вызов поиска у агента.
+
+### 10.4. Обновление индекса — запланированная задача
+
+Постоянного процесса нет: `watch` на Windows отказывается работать. Индекс обновляет
+задача планировщика моего пользователя (права администратора не нужны):
+
+```powershell
+PY -B student_tools.py --config SETTINGS schedule-index --interval-minutes 5
+PY -B student_tools.py --config SETTINGS schedule-index --interval-minutes 5
+schtasks /Query /TN AgentsTooling-KB-Index
+schtasks /Run /TN AgentsTooling-KB-Index
+Get-Content TOOLING\index-status.json
+```
+
+Задача `AgentsTooling-KB-Index` запускает `pythonw.exe` (без окна) с
+`student_tools.py --config SETTINGS index --status-file TOOLING\index-status.json` раз в
+N минут (N от 1 до 1440, по умолчанию 5), только пока я вошёл в систему, без повышенных
+прав; новый запуск не стартует, пока идёт прошлый, а второй `index` при работающем первом
+сразу отвечает `index-already-running`. Повторный schedule-index с тем же интервалом —
+`"changed": false`. Результат последнего прогона — в `index-status.json` (один небольшой
+файл, не растёт). Убрать задачу: `PY -B student_tools.py --config SETTINGS unschedule-index`.
+Не регистрируй задачу от администратора или SYSTEM и не ставь интервал меньше минуты.
+
+### 10.5. Whisper, Bitwarden, браузер
+
+**Whisper.** Как в разделе 6 (`fetch-whisper-model`, `transcribe`), тем же PY. Проверь
+без сети.
+
+**Bitwarden Secrets Manager (`bws`).** Только закреплённый официальный выпуск
+`bws-v2.1.0`, файл
+`https://github.com/bitwarden/sdk-sm/releases/download/bws-v2.1.0/bws-x86_64-pc-windows-msvc-2.1.0.zip`,
+SHA-256 `8d6f2b51beb6f992b5b1de8b85a98bdf18de74096b724d17fa06219fc23f2bd5` (сверь до
+распаковки; при несовпадении — СТОП). Распакуй в `TOOLING\bin\bws` и добавь эту папку в PATH
+моего пользователя (не системный), чтобы `bws` находил vault-run/vault-mcp. Проверка:
+`bws --version` показывает 2.1.0. Дальше — раздел 3 без изменений. На Windows vault-mcp
+запускает MCP-сервер дочерним процессом на тех же stdin/stdout (замены процесса, как на
+Mac/Ubuntu, в Windows нет) и возвращает его код выхода. Проверено в CI: загрузка, SHA-256 и
+`bws --version`; получение настоящего секрета из моего проекта на Windows не проверялось —
+проверь сам по разделу 9, пункт 7.
+
+**Браузер.** Hermes 0.23 на Windows: `hermes pm install chromium`, затем
+`HERMES_PYTHON -B browser-smoke.py --hermes-python HERMES_PYTHON --hermes-home "$env:LOCALAPPDATA\hermes\profiles\ПРОФИЛЬ"`,
+где HERMES_PYTHON — `$env:LOCALAPPDATA\hermes\hermes-agent\venv\Scripts\python.exe`
+(как в разделе 7). Этот путь на Windows проверялся только
+информационным шагом CI; если smoke не проходит — честно напиши мне «браузер на Windows не
+проверен», не обходи это видимым окном или моим Chrome/Edge.
+
+**Файловые инструменты (раздел 2) на Windows этим выпуском не проверялись.** Используй уже
+установленные; недостающие — только официальные пакеты через winget и с моего согласия, и
+отметь их в отчёте как непроверенные.
+
+### 10.6. Приёмка на Windows
+
+Готово только при проверках:
+
+1. `fetch-embedding-model` повторно — `changed: false`; `model-check` прошёл (SHA-256).
+2. `doctor`: `backend: file`, `schema: ok`, `wal: true`, `embeddingDimensions: 1024`, `local: true`.
+3. Поиск по-русски находит нужный файл; изменение файла меняет выдачу, удаление убирает
+   его из активной выдачи; соседний проект с тем же словом не попадает в результат.
+4. Агент вызывает MCP `agent_kb_search`, не просто видит подключение.
+5. Повторный bootstrap — `changed: false`, `changedFiles: 0`.
+6. Задача `AgentsTooling-KB-Index` есть, ручной `schtasks /Run` обновил `index-status.json`
+   со `status: ok`; постоянных процессов и служб базы знаний нет.
+7. Whisper без сети дал текст; `bws --version` — 2.1.0; браузер — по 10.5.
+8. Ни один секрет не попал в TOOLING, в файл базы и в инструкции профилей.
+
+В tooling/report.md отметь отдельно, что проверено на этом компьютере, а что — нет.

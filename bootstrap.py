@@ -21,6 +21,7 @@ inventory=importlib.util.module_from_spec(spec);spec.loader.exec_module(inventor
 BEGIN='<!-- agents-student-tooling:start -->'
 END='<!-- agents-student-tooling:end -->'
 BRAIN_FILES=('AGENTS.md','SOUL.md','IDENTITY.md','OUTPUT_STANDARDS.md','FIRST_RUN.md','COMMANDS.md')
+WINDOWS=os.name=='nt'
 
 
 class BootstrapError(ValueError):
@@ -75,14 +76,25 @@ def prepare(hermes_home,settings,via_vault=False,initial_index=False,enable_brow
     root=safe(hermes_home);settings=safe(settings)
     state=inventory.scan(hermes_home=root)
     if not state['profiles']:raise BootstrapError('Не найдены установленные профили агентов курса. Дооснащение ставится только поверх установленных агентов.')
-    cfg=json.loads(settings.read_text())
+    # Explicit UTF-8: on Windows the default is the ANSI code page and would garble Cyrillic
+    # (utf-8-sig also accepts the BOM that Windows PowerShell 5.1 writes).
+    cfg=json.loads(settings.read_text(encoding='utf-8-sig'))
     if cfg.get('schemaVersion')!=1 or cfg.get('embeddingModel')!='bge-m3' or cfg.get('embeddingDimensions')!=1024:
         raise ValueError('Review settings and vector schema first')
     if any(k in cfg.get('database',{}) for k in ('password','dsn','connectionString')):
         raise ValueError('Credentials must not be saved in settings')
-    if initial_index:
+    kind=cfg.get('backend','postgres')
+    if WINDOWS and kind!='file':
+        raise BootstrapError('На Windows база знаний работает только с backend file (SQLite + ONNX, без PostgreSQL и Ollama). '
+                             'Укажи "backend": "file" в settings.json по образцу settings.windows.example.json.')
+    schema_created=False
+    if initial_index or kind=='file':
         spec=importlib.util.spec_from_file_location('student_tools',HERE/'student_tools.py')
         tools=importlib.util.module_from_spec(spec);spec.loader.exec_module(tools)
+    if kind=='file':
+        # The base is one SQLite file: its schema is created here, no psql or schema.sql.
+        schema_created=tools.ensure_kb_schema(tools.config(settings))
+    if initial_index:
         tools.doctor(tools.config(settings))
     changes={};roots=list(cfg.get('roots',[]));names=[];unreadable=[]
     entry={'command':sys.executable,'args':['-B',str(HERE/'student_tools.py'),'--config',str(settings),'vault-mcp' if via_vault else 'mcp']}
@@ -107,7 +119,7 @@ def prepare(hermes_home,settings,via_vault=False,initial_index=False,enable_brow
             item={'path':str(snapshot),'profile':name,'project':'__skills__'}
             if not any(x.get('path')==str(snapshot) for x in roots):roots.append(item)
         config_path=safe(folder/'config.yaml')
-        current=yaml.safe_load(config_path.read_text()) if config_path.is_file() else {}
+        current=yaml.safe_load(config_path.read_text(encoding='utf-8')) if config_path.is_file() else {}
         if not isinstance(current,dict):raise ValueError('Unexpected profile config; preserve it')
         servers=current.setdefault('mcp_servers',{})
         if not isinstance(servers,dict):raise ValueError('MCP format needs version-specific review')
@@ -170,7 +182,7 @@ def prepare(hermes_home,settings,via_vault=False,initial_index=False,enable_brow
                 copy=backup/f'{i}.preimage';copy.write_bytes(data);copy.chmod(0o600)
                 manifest.append({'path':str(path),'file':copy.name,'sha256':hashlib.sha256(data).hexdigest()})
             else:manifest.append({'path':str(path),'file':None})
-        (backup/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2))
+        (backup/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
         (backup/'manifest.json').chmod(0o600)
         try:
             for path,body in plan.items():
@@ -190,6 +202,10 @@ def prepare(hermes_home,settings,via_vault=False,initial_index=False,enable_brow
             'registeredRoots':len(roots),'changedFiles':len(plan),'changed':bool(plan),
             'unreadableInstructions':sorted(set(unreadable)),
             'backup':str(backup) if plan else None,'gatewayReloadRequired':bool(plan),'telegramReaderChanged':False}
+    if kind=='file':
+        # The new base file is a change too; a repeat run creates nothing.
+        result.update({'backend':'file','kbFile':str(cfg['kbFile']),'kbSchemaCreated':schema_created,
+                       'changedFiles':len(plan)+int(schema_created),'changed':bool(plan) or schema_created})
     if initial_index:
         result['index']=tools.index(tools.config(settings))
     return result
@@ -200,6 +216,10 @@ if __name__=='__main__':
     p.add_argument('--settings',type=Path,required=True);p.add_argument('--via-vault',action='store_true')
     p.add_argument('--enable-headless-config',action='store_true');p.add_argument('--index',action='store_true')
     p.add_argument('--inspect',action='store_true');a=p.parse_args()
+    if WINDOWS:
+        # A pipe in a legacy code page must not crash on a path it cannot show.
+        for stream in (sys.stdout,sys.stderr):
+            if stream is not None and hasattr(stream,'reconfigure'):stream.reconfigure(errors='backslashreplace')
     try:
         result=inventory.scan(hermes_home=a.hermes_home) if a.inspect else prepare(a.hermes_home,a.settings,a.via_vault,a.index,a.enable_headless_config)
         print(json.dumps(result,ensure_ascii=False,indent=2))

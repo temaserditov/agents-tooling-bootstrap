@@ -17,7 +17,6 @@ import zipfile
 
 ROOT=Path(__file__).resolve().parents[1]
 EXCLUDE=re.compile(r'^(\.github/|release/)')
-STAMP=(2026,11,10,0,0,0)
 PRIVATE=[
     ('host path',re.compile(r'(?<![\w.])/(?:Users|home)/(?!x/|user/|student/|USER/|<|\$|\{)[A-Za-z0-9._-]+')),
     ('host path',re.compile(r'(?i)C:[\\/]+Users[\\/]+(?!USER\b|<|%|\$|Public\b|Default\b)[A-Za-z0-9._-]+')),
@@ -59,6 +58,8 @@ def build(version,output,qa=False):
     if not re.fullmatch(r'v\d{4}\.\d{2}\.\d{2}\.\d+',version):raise ValueError('Version looks like v2026.11.10.1')
     if git('status','--porcelain').strip():raise ValueError('Commit everything first: the release is built from HEAD')
     commit=git('rev-parse','HEAD').decode().strip()
+    # ZIP entry dates are the release date from the version: same tree, same bytes.
+    stamp=(*(int(x) for x in version[1:].split('.')[:3]),0,0,0)
     files=committed_files()
     bad=private_findings(files)
     if bad:raise ValueError('Personal data or secrets in the public bundle: '+json.dumps(bad,ensure_ascii=False))
@@ -68,13 +69,14 @@ def build(version,output,qa=False):
     buffer=io.BytesIO()
     with zipfile.ZipFile(buffer,'w') as archive:
         for name in sorted(files):
-            info=zipfile.ZipInfo(name,STAMP);info.external_attr=0o644<<16;info.compress_type=zipfile.ZIP_DEFLATED
+            info=zipfile.ZipInfo(name,stamp);info.external_attr=0o644<<16;info.compress_type=zipfile.ZIP_DEFLATED
             archive.writestr(info,files[name],compress_type=zipfile.ZIP_DEFLATED,compresslevel=9)
     payload=buffer.getvalue();sha=hashlib.sha256(payload).hexdigest();zip_name=f'agents-tooling-{version}.zip'
     header=(ROOT/'release/INSTALL-HEADER.md').read_text(encoding='utf-8')
     for key,value in {'VERSION':version,'ZIP_SHA256':sha,'COMMIT':commit}.items():header=header.replace('{{'+key+'}}',value)
     if '{{' in header:raise ValueError('Unfilled placeholder in INSTALL header')
-    if not qa and b'WINDOWS_STATUS' in files['FOR-CODEX.md']:raise ValueError('Set the Windows row in FOR-CODEX.md from the Windows x64 run first')
+    if not qa and (b'WINDOWS_STATUS' in files['FOR-CODEX.md'] or 'WINDOWS_STATUS' in header):
+        raise ValueError('Set the Windows x64 status in FOR-CODEX.md and release/INSTALL-HEADER.md from the Windows x64 run first')
     install=(header+files['FOR-CODEX.md'].decode('utf-8')).encode()
     exports={zip_name:payload,'SHA256SUMS':(sha+'  '+zip_name+'\n').encode(),'INSTALL-AGENTS-TOOLS.md':install}
     output=Path(output);output.mkdir(parents=True,exist_ok=True)

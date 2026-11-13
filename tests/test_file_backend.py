@@ -326,7 +326,7 @@ class WindowsProcesses(unittest.TestCase):
                 self.assertEqual(list(settings.parent.glob('.index-task-*.xml')),[])  # the definition file is not left behind
                 for bad in (0,-1,2000):
                     with self.assertRaises(tools.StudentFacingError):tools.schedule_index(settings,bad,python=pythonw,run=schtasks,windows=True)
-                with self.assertRaises(tools.StudentFacingError):tools.schedule_index(settings,5,python=pythonw,run=schtasks,windows=False)
+                with self.assertRaises(tools.StudentFacingError):tools.schedule_index(settings,5,python=pythonw,run=schtasks,windows=False,mac=False)
                 calls.clear()
                 self.assertTrue(tools.unschedule_index(settings,run=schtasks,windows=True)['changed'])
                 self.assertEqual([c[1] for c in calls],['/Query','/End','/Delete'])  # a running index is ended first
@@ -559,6 +559,146 @@ class RealModel(unittest.TestCase):
             if importlib.util.find_spec('mcp') is None:self.skipTest('model checks passed; no mcp client in this Python for the stdio part')
             answer=asyncio.run(mcp_call())
             self.assertEqual(answer['results'][0]['title'],'mayak.md')
+
+
+class MacFileBackend(unittest.TestCase):
+    """Mac: backend file on Apple Silicon (macOS 14+), the index refreshed by a LaunchAgent."""
+
+    def test_mac_file_backend_needs_apple_silicon_and_macos_14(self):
+        tools.mac_file_supported('27.0.1','arm64');tools.mac_file_supported('14.0','arm64')
+        tools.mac_file_supported('15.7.2','arm64');tools.mac_file_supported('26.1','arm64')
+        for version,machine in (('13.7','arm64'),('','arm64'),('15.0','x86_64'),('27.0','x86_64')):
+            with self.assertRaises(tools.StudentFacingError):tools.mac_file_supported(version,machine)
+
+    def test_mac_config_refuses_intel_and_old_macos_for_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp).resolve();settings=root/'settings.json'
+            settings.write_text(json.dumps(file_cfg(root)),encoding='utf-8')
+            with patch.object(tools,'IS_MAC',True),patch.object(tools,'IS_WINDOWS',False):
+                with patch.object(tools.platform,'machine',return_value='arm64'),patch.object(tools.platform,'mac_ver',return_value=('27.0.1','','')):
+                    self.assertEqual(tools.config(settings)['backend'],'file')
+                with patch.object(tools.platform,'machine',return_value='x86_64'),patch.object(tools.platform,'mac_ver',return_value=('15.7','','')):
+                    with self.assertRaises(tools.StudentFacingError):tools.config(settings)
+                with patch.object(tools.platform,'machine',return_value='arm64'),patch.object(tools.platform,'mac_ver',return_value=('13.6','','')):
+                    with self.assertRaises(tools.StudentFacingError):tools.config(settings)
+
+    def test_watch_is_refused_for_the_file_backend_on_mac(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp).resolve();settings=root/'settings.json'
+            settings.write_text(json.dumps(file_cfg(root)),encoding='utf-8')
+            with patch.object(tools,'IS_WINDOWS',False),patch.object(tools,'IS_MAC',True),\
+                 patch.object(tools,'mac_file_supported',return_value=None),\
+                 patch.object(sys,'argv',['student_tools.py','--config',str(settings),'watch']),\
+                 patch.object(tools,'index',side_effect=AssertionError('no watch loop')):
+                with self.assertRaises(tools.StudentFacingError) as caught:tools.main()
+            self.assertIn('schedule-index',str(caught.exception))
+
+    def test_launch_agent_is_per_user_bounded_and_idempotent(self):
+        import plistlib
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp).resolve()/'Папка ученика';settings=root/'tooling/settings.json';settings.parent.mkdir(parents=True)
+            settings.write_text('{}',encoding='utf-8');python=root/'tooling/venv/bin/python';python.parent.mkdir(parents=True);python.write_bytes(b'')
+            agents=root/'Library/LaunchAgents';loaded={};calls=[]
+            def launchctl(args,**kw):
+                calls.append(args[1:]);self.assertIs(kw.get('stdin'),subprocess.DEVNULL);self.assertEqual(args[0],'/bin/launchctl')
+                if args[1]=='print':return subprocess.CompletedProcess(args,0 if loaded else 113)
+                if args[1]=='bootstrap':
+                    self.assertEqual(args[2],'gui/501');loaded['plist']=Path(args[3]).read_bytes();return subprocess.CompletedProcess(args,0)
+                if args[1]=='bootout':loaded.clear();return subprocess.CompletedProcess(args,0)
+                raise AssertionError(args)
+            first=tools.schedule_index_mac(settings,5,python=python,run=launchctl,agents_dir=agents,uid=501)
+            self.assertTrue(first['changed']);self.assertEqual(first['task'],'com.infobizagents.tooling.kb-index')
+            self.assertEqual(first['runNow'],'launchctl kickstart gui/501/com.infobizagents.tooling.kb-index')
+            plist=agents/'com.infobizagents.tooling.kb-index.plist'
+            body=plistlib.loads(plist.read_bytes())
+            self.assertEqual(oct(plist.stat().st_mode&0o777),'0o644')
+            self.assertEqual(body['StartInterval'],300);self.assertFalse(body['RunAtLoad']);self.assertEqual(body['ProcessType'],'Background')
+            self.assertEqual(body['ProgramArguments'],[str(python),'-B',str(Path(tools.__file__).resolve()),'--config',str(settings),
+                                                       'index','--status-file',str(settings.parent/'index-status.json')])
+            self.assertNotIn('watch',body['ProgramArguments']);self.assertNotIn('KeepAlive',body)
+            self.assertEqual(body['StandardOutPath'],'/dev/null')
+            self.assertFalse(any('EnvironmentVariables' in k for k in body))  # no secret can ride in the plist
+            boots=sum(c[0]=='bootstrap' for c in calls)
+            self.assertIs(tools.schedule_index_mac(settings,5,python=python,run=launchctl,agents_dir=agents,uid=501)['changed'],False)
+            self.assertEqual(sum(c[0]=='bootstrap' for c in calls),boots)
+            calls.clear()
+            self.assertTrue(tools.schedule_index_mac(settings,10,python=python,run=launchctl,agents_dir=agents,uid=501)['changed'])
+            self.assertEqual([c[0] for c in calls],['print','bootout','bootstrap'])
+            self.assertEqual(plistlib.loads(loaded['plist'])['StartInterval'],600)
+            self.assertEqual(list(agents.glob('.*')),[])
+            for bad in (0,-1,2000,True):
+                with self.assertRaises(tools.StudentFacingError):tools.schedule_index_mac(settings,bad,python=python,run=launchctl,agents_dir=agents,uid=501)
+            calls.clear()
+            self.assertTrue(tools.unschedule_index_mac(settings,run=launchctl,agents_dir=agents,uid=501)['changed'])
+            self.assertEqual([c[0] for c in calls],['print','bootout']);self.assertFalse(plist.exists())
+            self.assertIs(tools.unschedule_index_mac(settings,run=launchctl,agents_dir=agents,uid=501)['changed'],False)
+
+    def test_failed_launchctl_bootstrap_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp).resolve();settings=root/'settings.json';settings.write_text('{}');python=root/'python';python.write_bytes(b'')
+            def launchctl(args,**kw):return subprocess.CompletedProcess(args,113 if args[1]=='print' else 5)
+            with self.assertRaises(tools.StudentFacingError) as caught:
+                tools.schedule_index_mac(settings,5,python=python,run=launchctl,agents_dir=root/'LaunchAgents',uid=501)
+            self.assertIn('launchctl',str(caught.exception))
+
+    def test_schedule_index_dispatches_by_os(self):
+        with patch.object(tools,'schedule_index_mac',return_value={'changed':True,'task':'mac'}) as mac:
+            self.assertEqual(tools.schedule_index('s.json',5,windows=False,mac=True)['task'],'mac');mac.assert_called_once()
+        with patch.object(tools,'unschedule_index_mac',return_value={'changed':False}) as mac:
+            tools.unschedule_index('s.json',windows=False,mac=True);mac.assert_called_once()
+        with self.assertRaises(tools.StudentFacingError):tools.schedule_index('s.json',5,windows=False,mac=False)
+        with self.assertRaises(tools.StudentFacingError):tools.unschedule_index('s.json',windows=False,mac=False)
+
+
+class MacBackendChoice(unittest.TestCase):
+    inventory=load('inventory_mac','inventory.py')
+
+    def test_backend_by_macos_version_architecture_and_homebrew(self):
+        choose=self.inventory.mac_kb_backend;brew='/opt/homebrew/bin/brew'
+        self.assertEqual(choose(15,True,brew),('postgres','macos15-homebrew'))
+        self.assertEqual(choose(15,True,None),('file','no-homebrew'))
+        self.assertEqual(choose(14,True,brew),('file','macos14-no-homebrew-bottles'))
+        for major in (26,27,28):self.assertEqual(choose(major,True,brew)[0],'file')
+        self.assertEqual(choose(13,True,brew),(None,'macos-older-than-14-unsupported'))
+        self.assertEqual(choose(27,False,'/usr/local/bin/brew'),(None,'intel-mac-unsupported'))
+
+    def test_macos_version_comes_from_sw_vers_not_the_compat_10_16(self):
+        def sw_vers(args,**kw):
+            self.assertEqual(kw['env'].get('SYSTEM_VERSION_COMPAT'),'0')
+            return subprocess.CompletedProcess(args,0,stdout='27.0.1\n')
+        self.assertEqual(self.inventory.mac_product_version(run=sw_vers),'27.0.1')
+        with patch.object(self.inventory.platform,'mac_ver',return_value=('15.6','','')):
+            self.assertEqual(self.inventory.mac_product_version(run=lambda *a,**k:(_ for _ in ()).throw(OSError())),'15.6')
+
+
+class ForeignKnowledgeBases(unittest.TestCase):
+    """A base an agent built on its own is found, read only, and never confused with ours."""
+    inventory=load('inventory_foreign','inventory.py')
+
+    def test_self_made_base_is_reported_without_contents(self):
+        import sqlite3,yaml
+        with tempfile.TemporaryDirectory() as tmp:
+            home=Path(tmp).resolve();folder=home/'.hermes/profiles/tech';(folder/'skills/farvater-kb').mkdir(parents=True)
+            (folder/'skills/farvater-kb/SKILL.md').write_text('# Farvater\nПоиск через sqlite-vec по базе знаний.',encoding='utf-8')
+            (folder/'skills/design/SKILL.md').parent.mkdir(parents=True)
+            (folder/'skills/design/SKILL.md').write_text('# Design\nChroma, contrast and lightness of colours.',encoding='utf-8')
+            (folder/'config.yaml').write_text(yaml.safe_dump({'mcp_servers':{
+                'farvater':{'command':'python3','args':['farvater_mcp.py','--db','farvater.sqlite']},
+                'telegram-reader':{'command':'reader'},'student-agent-kb':{'command':'ours'}}}),encoding='utf-8')
+            base=home/'InfobizAgents/farvater/farvater.sqlite';base.parent.mkdir(parents=True)
+            db=sqlite3.connect(base);db.execute('create table docs(id integer primary key,text text,embedding blob)')
+            db.execute("insert into docs(text,embedding) values('СЕКРЕТНЫЙ ТЕКСТ УЧЕНИКА',x'00')");db.commit();db.close()
+            plain=home/'InfobizAgents/notes.db';db=sqlite3.connect(plain);db.execute('create table notes(x text)');db.commit();db.close()
+            ours=home/'InfobizAgents/tooling/kb/agents-student-kb.sqlite';ours.parent.mkdir(parents=True)
+            (home/'InfobizAgents/tooling/student_tools.py').write_text('')
+            db=sqlite3.connect(ours);db.execute('create table kb_meta(k)');db.execute('create table documents(embedding blob)');db.execute('create table chunks(x)');db.commit();db.close()
+            found=self.inventory.foreign_knowledge_bases(home,[{'id':'tech','path':str(folder)}])
+            kinds={(x['kind'],x.get('name') or Path(x.get('path','')).name) for x in found}
+            self.assertEqual(kinds,{('mcp','farvater'),('skill','farvater-kb'),('sqlite','farvater.sqlite')})
+            sqlite_entry=next(x for x in found if x['kind']=='sqlite')
+            self.assertEqual(sqlite_entry['tables'],{'docs':1})
+            self.assertNotIn('СЕКРЕТНЫЙ',json.dumps(found,ensure_ascii=False))
+            self.assertTrue(next(x for x in found if x['kind']=='mcp')['enabled'])
 
 
 if __name__=='__main__':unittest.main()

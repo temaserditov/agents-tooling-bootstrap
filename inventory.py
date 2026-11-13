@@ -114,6 +114,168 @@ def windows_arm64():
     return native.value==0xAA64
 
 
+# Mac knowledge base (FOR-CODEX.md, section 11). Homebrew publishes PostgreSQL/pgvector
+# bottles for Apple Silicon macOS 15, 26 and 27 only; this package verified the PostgreSQL
+# path on macOS 15. Everything else that can run it takes backend file (no services).
+MAC_POSTGRES_VERIFIED=(15,)
+MAC_FILE_MIN_MAJOR=14
+VENV_PYTHON_CHECK=('import sys,sqlite3,venv,ensurepip;'
+                   'assert (3,11)<=sys.version_info[:2]<=(3,13);'
+                   'sqlite3.connect(":memory:").execute("create virtual table t using fts5(x)")')
+
+
+def mac_major(text):
+    found=re.match(r'\s*(\d+)',text or '')
+    return int(found.group(1)) if found else 0
+
+
+def mac_product_version(run=subprocess.run):
+    """macOS version; a Python built with an old SDK reports 10.16 instead, so sw_vers decides."""
+    try:
+        out=run(['/usr/bin/sw_vers','-productVersion'],capture_output=True,text=True,stdin=subprocess.DEVNULL,
+                timeout=10,env={**os.environ,'SYSTEM_VERSION_COMPAT':'0'}).stdout.strip()
+        if re.fullmatch(r'\d+(\.\d+)*',out):return out
+    except (OSError,subprocess.SubprocessError):pass
+    return platform.mac_ver()[0]
+
+
+def apple_silicon(run=subprocess.run):
+    """True on Apple Silicon, also when this Python itself runs under Rosetta."""
+    if platform.machine()=='arm64':return True
+    try:out=run(['/usr/sbin/sysctl','-n','hw.optional.arm64'],capture_output=True,text=True,stdin=subprocess.DEVNULL,timeout=10).stdout
+    except (OSError,subprocess.SubprocessError):return False
+    return out.strip()=='1'
+
+
+def mac_kb_backend(major,silicon,homebrew):
+    """(backend, reason): which knowledge-base backend this Mac gets; backend None = stop."""
+    if not silicon:return None,'intel-mac-unsupported'
+    if major<MAC_FILE_MIN_MAJOR:return None,'macos-older-than-14-unsupported'
+    if major in MAC_POSTGRES_VERIFIED and homebrew:return 'postgres','macos15-homebrew'
+    if major in MAC_POSTGRES_VERIFIED:return 'file','no-homebrew'
+    if major<min(MAC_POSTGRES_VERIFIED):return 'file','macos14-no-homebrew-bottles'
+    return 'file','macos-newer-than-verified-postgres'
+
+
+def venv_pythons(home):
+    """Interpreters for the package venv (3.11-3.13, venv+pip, SQLite with FTS5), best first.
+
+    uv-managed Python first: it does not move when Hermes updates its own runtime.
+    """
+    found=[];seen=set()
+    patterns=[(home/'.local/share/uv/python','cpython-3.1[23]*-macos-aarch64-none/bin/python3.1[23]'),
+              (home/'.local/share/uv/python','cpython-3.11*-macos-aarch64-none/bin/python3.11'),
+              (Path('/Library/Frameworks/Python.framework/Versions'),'3.1[123]/bin/python3.1[123]'),
+              (Path('/opt/homebrew/bin'),'python3.1[123]')]
+    for base,pattern in patterns:
+        if not base.is_dir():continue
+        for python in sorted(base.glob(pattern),reverse=True):
+            key=str(python.resolve()) if python.exists() else None
+            if not key or key in seen or not python.is_file():continue
+            seen.add(key)
+            if probe(python,VENV_PYTHON_CHECK)==0:found.append(str(python))
+    return found
+
+
+def mac_state(home):
+    version=mac_product_version();major=mac_major(version);silicon=apple_silicon()
+    brew=Path('/opt/homebrew/bin/brew') if silicon else Path('/usr/local/bin/brew')
+    homebrew=str(brew) if brew.is_file() else None
+    backend,reason=mac_kb_backend(major,silicon,homebrew)
+    return {'macosVersion':version,'macosMajor':major,'appleSilicon':silicon,
+            'pythonNativeArm64':platform.machine()=='arm64','homebrew':homebrew,
+            'kbBackend':backend,'kbBackendReason':reason,'venvPythonCandidates':venv_pythons(home)}
+
+
+# Another knowledge base an agent (or an earlier Codex run) built on its own: FOR-CODEX.md,
+# section 12. Only names, table names and row counts are read, never the contents.
+KB_HINT=re.compile(r'(?i)sqlite[-_]?vec|\bvec0\b|sqlite[-_]?vss|\bvss0\b|chromadb|lancedb|\bfaiss\b|qdrant|embedding|'
+                   r'vector|knowledge[-_ ]?base|\bkb\b|\brag\b|farvater|фарватер|векторн|база знаний')
+SKILL_HINT=re.compile(r'(?i)sqlite[-_]?vec|\bvec0\b|\bvss0\b|chromadb|lancedb|\bfaiss\b|farvater|фарватер')
+VECTOR_SQL=re.compile(r'(?i)using\s+(vec0|vss0|vss)|embedding|vector')
+FOREIGN_SKIP={'node_modules','.git','.cache','cache','logs','sessions','backups','integration-backups',
+              'venv','.venv','site-packages','browser-profile-tooling','models','Library','.Trash'}
+DB_SUFFIXES=('.sqlite','.sqlite3','.db')
+
+
+def sqlite_summary(path):
+    """Read-only: tables and row counts of a database that stores vectors, else None."""
+    import sqlite3
+    from urllib.parse import quote
+    uri='file:'+quote(str(path))+'?mode=ro';extra={}
+    try:
+        db=sqlite3.connect(uri,uri=True,timeout=2);rows=db.execute("select name,sql from sqlite_master where type='table'").fetchall()
+    except sqlite3.Error:
+        # A WAL base without a -shm file opens read-only only as immutable (the -wal part unread).
+        try:
+            db=sqlite3.connect(uri+'&immutable=1',uri=True,timeout=2);extra={'walNotRead':True}
+            rows=db.execute("select name,sql from sqlite_master where type='table'").fetchall()
+        except sqlite3.Error:return {'tables':{},'unreadable':True} if KB_HINT.search(path.name) else None
+    try:
+        names={name for name,_ in rows}
+        if {'kb_meta','chunks','documents'}<=names:return None  # this package's own base
+        if not any(VECTOR_SQL.search(sql or '') for _,sql in rows):return None
+        tables={}
+        for name,sql in rows:
+            if name.startswith('sqlite_') or re.search(r'_(data|idx|content|docsize|config|chunks|rowids|info|vector_chunks\d*)$',name):continue
+            try:tables[name]=db.execute('select count(*) from "'+name.replace('"','""')+'"').fetchone()[0]
+            except sqlite3.Error:tables[name]=None
+        return {'tables':tables,'vectorTables':sorted(n for n,sql in rows if re.search(r'(?i)using\s+(vec0|vss0|vss)',sql or '')),**extra}
+    except sqlite3.Error:return {'tables':{},'unreadable':True}
+    finally:db.close()
+
+
+def walk_limited(base,depth):
+    base=Path(base)
+    if not base.is_dir() or base.is_symlink():return
+    start=len(base.parts)
+    for dirpath,dirs,files in os.walk(base):
+        here=Path(dirpath)
+        dirs[:]=sorted(d for d in dirs if d not in FOREIGN_SKIP and not (here/d).is_symlink() and len(here.parts)-start<depth)
+        yield here,dirs,files
+
+
+def foreign_knowledge_bases(home,profiles,yaml=None):
+    """MCP servers, skills and SQLite files that look like a knowledge base not from this package."""
+    found=[]
+    if yaml is None:
+        try:import yaml
+        except ImportError:yaml=False
+    for profile in profiles:
+        folder=Path(profile['path']);config=folder/'config.yaml'
+        if yaml and config.is_file() and not config.is_symlink():
+            try:current=yaml.safe_load(config.read_text(encoding='utf-8')) or {}
+            except Exception:current={}
+            servers=current.get('mcp_servers') if isinstance(current,dict) else None
+            for name,entry in (servers.items() if isinstance(servers,dict) else []):
+                if name=='student-agent-kb':continue
+                text=name+' '+json.dumps(entry,ensure_ascii=False) if isinstance(entry,(dict,list)) else name
+                if KB_HINT.search(text):
+                    found.append({'kind':'mcp','profile':profile['id'],'name':name,
+                                  'enabled':not (isinstance(entry,dict) and entry.get('enabled') is False)})
+        for here,dirs,files in walk_limited(folder/'skills',3):
+            if 'SKILL.md' in files:
+                try:text=(here/'SKILL.md').read_text(encoding='utf-8',errors='replace')[:20000]
+                except OSError:continue
+                head=here.name+' '+text
+                if SKILL_HINT.search(head) or \
+                   (KB_HINT.search(here.name) and re.search(r'(?i)embedding|вектор',text)):
+                    found.append({'kind':'skill','profile':profile['id'],'name':here.name,'path':str(here)})
+    seen=set()
+    bases=[home/'InfobizAgents',home/'.hermes/profiles',*[p for p in sorted(home.glob('*')) if p.is_dir() and KB_HINT.search(p.name)]]
+    for base in bases:
+        for here,dirs,files in walk_limited(base,4):
+            if here.name=='tooling' and (here/'student_tools.py').is_file():
+                dirs[:]=[d for d in dirs if d!='kb']
+            for name in files:
+                if not name.lower().endswith(DB_SUFFIXES):continue
+                path=here/name;key=str(path)
+                if key in seen or path.is_symlink():continue
+                seen.add(key);summary=sqlite_summary(path)
+                if summary:found.append({'kind':'sqlite','path':key,'bytes':path.stat().st_size,**summary})
+    return found
+
+
 def scan(home=None,hermes_home=None):
     home=Path(home) if home is not None else Path.home()
     # Windows: the official Hermes lives in %LOCALAPPDATA%\\hermes (Windows v3); the
@@ -142,7 +304,10 @@ def scan(home=None,hermes_home=None):
         except importlib.metadata.PackageNotFoundError:packages[name]=None
     shell=home/'InfobizAgents/web-shell'
     extra={'windowsArm64':windows_arm64()} if platform.system()=='Windows' else {}
-    return {**extra,'schemaVersion':1,'os':platform.system(),'architecture':platform.machine(),
+    if platform.system()=='Darwin':extra={'mac':mac_state(home)}
+    try:foreign=foreign_knowledge_bases(home,profiles)
+    except Exception as error:foreign=[{'kind':'scan-failed','errorClass':type(error).__name__}]
+    return {**extra,'schemaVersion':1,'otherKnowledgeBases':foreign,'os':platform.system(),'architecture':platform.machine(),
             'freeDiskBytes':shutil.disk_usage(home).free,'profiles':profiles,
             'hermesVersion':version,'browserMode':browser_mode(version),'hermesMcpClient':mcp_client,'hermesPython':str(hermes_py) if hermes_py else None,
             'commands':{name:shutil.which(name) for name in COMMANDS},
@@ -153,7 +318,9 @@ def scan(home=None,hermes_home=None):
                      'Telegram Reader is intentionally excluded.',
                      'Hermes 0.23+ has no agent-browser: use its own Chromium (hermes pm install chromium).',
                      'hermesMcpClient false: MCP servers cannot connect; on 0.23 run hermes pm install --extra mcp.',
-                     'hermesPython: the interpreter Hermes runs on (browser-smoke --hermes-python); null if not found.']}
+                     'hermesPython: the interpreter Hermes runs on (browser-smoke --hermes-python); null if not found.',
+                     'otherKnowledgeBases: a knowledge base not from this package (section 12); never delete it.',
+                     'mac.kbBackend: the knowledge-base backend for this Mac (FOR-CODEX.md section 11); null = stop.']}
 
 
 if __name__=='__main__':

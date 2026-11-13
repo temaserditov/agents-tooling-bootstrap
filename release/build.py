@@ -75,7 +75,7 @@ def build(version,output,qa=False):
     header=(ROOT/'release/INSTALL-HEADER.md').read_text(encoding='utf-8')
     for key,value in {'VERSION':version,'ZIP_SHA256':sha,'COMMIT':commit}.items():header=header.replace('{{'+key+'}}',value)
     if '{{' in header:raise ValueError('Unfilled placeholder in INSTALL header')
-    if not qa and (b'WINDOWS_STATUS' in files['FOR-CODEX.md'] or 'WINDOWS_STATUS' in header):
+    if not qa and any(m.encode() in files['FOR-CODEX.md'] or m in header for m in ('WINDOWS_STATUS','MAC_FILE_STATUS')):
         raise ValueError('Set the Windows x64 status in FOR-CODEX.md and release/INSTALL-HEADER.md from the Windows x64 run first')
     install=(header+files['FOR-CODEX.md'].decode('utf-8')).encode()
     exports={zip_name:payload,'SHA256SUMS':(sha+'  '+zip_name+'\n').encode(),'INSTALL-AGENTS-TOOLS.md':install}

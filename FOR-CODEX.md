@@ -58,7 +58,7 @@ Ollama, Homebrew и служб); `null` — Intel Mac или macOS 13 и ста�
 | ОС | Статус |
 |---|---|
 | macOS 15, Apple Silicon, рабочий Homebrew | база знаний PostgreSQL + Ollama (разделы 4–5); проверено в виртуальной машине (macOS 15) |
-| macOS 14, 26, 27 и новее, Apple Silicon; macOS 15 без Homebrew | база знаний — файл SQLite + bge-m3 внутри процесса, без служб (раздел 11); MAC_FILE_STATUS |
+| macOS 14, 26, 27 и новее, Apple Silicon; macOS 15 без Homebrew | база знаний — файл SQLite + bge-m3 внутри процесса, без служб (раздел 11); проверено в виртуальной машине macOS 15 (официальный Hermes 0.23.0) и на macOS 27; macOS 14 и 26 отдельно не проверялись |
 | macOS 13 и старше; Mac на Intel | база знаний НЕ ставится (нет сборок PostgreSQL/Ollama/ONNX Runtime): скажи мне |
 | Ubuntu 24.04 VPS, x86_64/arm64 | поддерживается; проверено в виртуальной машине (Ubuntu 24.04) |
 | Windows 10/11 x64 (официальный Hermes, Windows v3) | поддерживается по разделу 10 (база знаний — файл SQLite + bge-m3 через ONNX, без служб); проверено на GitHub windows-2025 (Windows Server, синтетические профили): модель, индекс, русский поиск, MCP, задача планировщика, Whisper без сети, bws, headless-браузер |
@@ -784,7 +784,7 @@ Drive без отдельного разрешения. Материалы аг�
 
 Пункты 1–5 и 8 из 10.6 (вместо `schtasks` — `launchctl kickstart` и `index-status.json` со
 `status: ok`; в `doctor` — `backend: file`), плюс раздел 9 (Whisper, браузер, Bitwarden — как
-на Mac обычно). Что проверено разработчиком пакета: MAC_FILE_STATUS. В tooling/report.md
+на Mac обычно). Что проверено разработчиком пакета: виртуальная машина macOS 15.7 (официальный Hermes 0.23.0, синтетические профили, backend `file` принудительно) — загрузка модели с SHA-256, индекс, русский поиск, изменение/удаление/соседний проект, реальный MCP-вызов и `hermes mcp test` у двух профилей, LaunchAgent (новый `runId`, `last exit code = 0`), отсутствие секрета-приманки; macOS 27.0.1 — тот же путь во временной папке с настоящим launchd. Не проверялись: macOS 14 и 26, настоящий профиль ученика после установщика курса, Mac с 8 ГБ ОЗУ. В tooling/report.md
 отметь, что база знаний — backend `file`, и почему (`mac.kbBackendReason`).
 
 ## 12. Если на компьютере уже есть самодельная база знаний

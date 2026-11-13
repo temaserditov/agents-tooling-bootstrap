@@ -275,11 +275,15 @@ def sqlite_summary(path,attempts=3,budget=None):
     with rowsKnown false (contents unknown), never as empty.
     """
     import sqlite3,tempfile,time
-    path=Path(path);wal=Path(str(path)+'-wal')
+    path=Path(path);wal=Path(str(path)+'-wal');journal=Path(str(path)+'-journal')
+    # A non-empty rollback journal: a write may be half applied to the main file. Its copy
+    # could show rows already deleted (or not yet added), so the contents are unknown.
+    hot=lambda:bool((file_state(journal) or (0,))[0])
     unknown=lambda reason:{'rowsKnown':False,'tables':{},'reason':reason}
     budget=budget or ScanBudget()
     before=(file_state(path),file_state(wal))
     if before[0] is None:return unknown('unreadable')
+    if hot():return unknown('transaction-in-progress')
     with tempfile.TemporaryDirectory(prefix='agents-inventory-') as tmp:
         copy=Path(tmp)/'copy.sqlite'
         for _ in range(attempts):
@@ -290,6 +294,7 @@ def sqlite_summary(path,attempts=3,budget=None):
                 if done and before[1]:done=copy_bounded(wal,Path(str(copy)+'-wal'),budget.deadline,budget.clock)
             except OSError:return unknown('unreadable')
             if not done:budget.exhausted=True;return unknown('time-limit')
+            if hot():return unknown('transaction-in-progress')
             after=(file_state(path),file_state(wal))
             if after==before:break
             before=after

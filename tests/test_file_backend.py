@@ -1031,5 +1031,17 @@ class ForeignKnowledgeBases(unittest.TestCase):
             found=self.inventory.foreign_knowledge_bases(home,[{'id':'tech','path':str(hermes/'tech')}])
             self.assertEqual([Path(x['path']).name for x in found if x['kind']=='sqlite'],['projects.db'])
 
+    def test_a_half_written_transaction_makes_contents_unknown(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as tmp:
+            home=Path(tmp).resolve();folder=home/'InfobizAgents/x';folder.mkdir(parents=True);base=folder/'kb.db'
+            db=sqlite3.connect(base,isolation_level=None);db.execute('create table docs(id integer primary key,embedding blob)')
+            db.executemany('insert into docs(embedding) values(?)',[(b'x',)]*40)
+            db.execute('pragma cache_size=1');db.execute('begin');db.execute('delete from docs')  # uncommitted
+            self.assertTrue(Path(str(base)+'-journal').is_file())
+            entry=next(x for x in self.inventory.foreign_knowledge_bases(home,[]) if x['kind'].startswith('sqlite'))
+            db.execute('rollback');db.close()
+            self.assertEqual((entry['kind'],entry['rowsKnown'],entry['reason']),('sqlite-unchecked',False,'transaction-in-progress'))
+
 
 if __name__=='__main__':unittest.main()

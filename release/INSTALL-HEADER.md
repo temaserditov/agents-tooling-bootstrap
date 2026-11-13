@@ -38,7 +38,8 @@ GitHub-вход, токен курса и доступ к приватному �
 3. Mac: какую базу знаний ставить, решает inventory.py (поле `mac.kbBackend`, разделы 0 и 11
    полного задания). macOS 15 с рабочим Homebrew — PostgreSQL + Ollama; macOS 14, 26, 27 и
    новее (и macOS 15 без Homebrew) — файл SQLite и модель bge-m3 внутри процесса, без
-   PostgreSQL, Ollama, Homebrew и служб (MAC_FILE_STATUS). Intel Mac и macOS 13 и старше —
+   PostgreSQL, Ollama, Homebrew и служб (проверено на macOS 15 в виртуальной машине и на macOS 27;
+   macOS 14 и 26 отдельно не проверялись). Intel Mac и macOS 13 и старше —
    база знаний не ставится: скажи мне. Если PostgreSQL на Mac не встаёт — переходи на раздел 11.
 4. Никогда не собирай свою базу знаний (свой SQLite с векторами, sqlite-vec, Chroma, свой
    поиск) вместо этого пакета. Если самодельная база уже есть — раздел 12: ничего в ней не

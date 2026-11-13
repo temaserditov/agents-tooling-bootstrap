@@ -1119,12 +1119,12 @@ def schedule_index(settings,interval_minutes=5,python=None,run=subprocess.run,wi
     return {'changed':True,**result}
 
 
-def launch_agent_plist(python,settings,interval_minutes,label=INDEX_AGENT_LABEL):
+def launch_agent_plist(python,settings,interval_minutes,label=INDEX_AGENT_LABEL,tools=None):
     """The LaunchAgent: `index` every N minutes in the background, nothing stays running."""
     import plistlib
     settings=Path(settings);status=settings.parent/'index-status.json'
     body={'Label':label,
-          'ProgramArguments':[str(python),'-B',str(Path(__file__).resolve()),'--config',str(settings),
+          'ProgramArguments':[str(python),'-B',str(tools or Path(__file__).resolve()),'--config',str(settings),
                               'index','--status-file',str(status)],
           'StartInterval':int(interval_minutes)*60,'RunAtLoad':False,
           # Background: throttled CPU and disk, like a Windows task of an idle user.
@@ -1145,7 +1145,9 @@ def loaded_job(run,target):
     From `launchctl print`: the plist path, the run interval and the program arguments.
     """
     done=launchctl(run,'print',target)
-    if done.returncode:return {}
+    # 113: launchd has no such service. Any other failure is an unknown state, not "absent".
+    if done.returncode==113:return {}
+    if done.returncode:return None
     out=done.stdout.decode('utf-8','replace') if isinstance(done.stdout,bytes) else (done.stdout or '')
     path=re.search(r'(?m)^\s*path = (.+)$',out);interval=re.search(r'(?m)^\s*run interval = (\d+) seconds',out)
     block=re.search(r'(?ms)^\s*arguments = \{\n(.*?)^\s*\}',out)
@@ -1196,7 +1198,11 @@ def schedule_index_mac(settings,interval_minutes=5,python=None,run=subprocess.ru
     if job and job_settings(job) not in (None,str(settings)) and job['path']!=str(plist):
         raise StudentFacingError('Задача '+INDEX_AGENT_LABEL+' загружена другой установкой ('+str(job_settings(job))+'); '
                                  'сначала выполни unschedule-index с её settings.json.')
+    # What launchd runs now is what a failed change must give back: rebuilt from the loaded
+    # job when it is ours (the plist is deterministic), else the file on disk.
     previous=plist.read_bytes() if plist.is_file() else None
+    if job and job_settings(job) and job['interval'] and len(job['arguments'])==8 and job['arguments'][1]=='-B':
+        previous,_=launch_agent_plist(job['arguments'][0],job_settings(job),job['interval']//60,tools=job['arguments'][2])
     agents.mkdir(parents=True,exist_ok=True)
     # The new definition is written next to the plist first: a failure here changes nothing.
     stage=plist.with_name('.'+plist.name+'.'+uuid.uuid4().hex[:8])
@@ -1215,7 +1221,10 @@ def schedule_index_mac(settings,interval_minutes=5,python=None,run=subprocess.ru
             back=plist.with_name('.'+plist.name+'.'+uuid.uuid4().hex[:8]);back.write_bytes(previous);back.chmod(0o644)
             os.replace(back,plist)
         except OSError:return False
-        return not job or launchctl(run,'bootstrap',f'gui/{uid}',str(plist)).returncode==0
+        if not job:return True
+        if launchctl(run,'bootstrap',f'gui/{uid}',str(plist)).returncode:return False
+        again=loaded_job(run,target)
+        return bool(again) and again.get('arguments')==job.get('arguments') and again.get('interval')==job.get('interval')
     try:os.replace(stage,plist)
     except OSError:
         stage.unlink();ok=restore()
@@ -1239,10 +1248,13 @@ def unschedule_index_mac(settings,run=subprocess.run,agents_dir=None,uid=None):
     plist=guard(agents/(INDEX_AGENT_LABEL+'.plist'));target=f'gui/{uid}/{INDEX_AGENT_LABEL}'
     job=loaded_job(run,target)
     if job is None:raise StudentFacingError('Не удалось прочитать состояние '+INDEX_AGENT_LABEL+' в launchctl; я её не снимаю.')
-    owners={o for o in (plist_settings(plist) if plist.is_file() else None,job_settings(job) if job else None) if o}
-    if owners-{str(settings)} or (plist.is_file() and not owners) or (job and not job_settings(job)):
-        raise StudentFacingError('Задача '+INDEX_AGENT_LABEL+' принадлежит другой установке пакета ('
-                                 +', '.join(sorted(owners)) +'); я её не снимаю. Выполни unschedule-index с её settings.json.')
+    # The file and the loaded job are checked on their own: each must belong to these settings.
+    file_owner=plist_settings(plist) if plist.is_file() else str(settings)
+    job_owner=job_settings(job) if job else str(settings)
+    if file_owner!=str(settings) or job_owner!=str(settings):
+        other=', '.join(sorted({str(o) for o in (file_owner,job_owner) if o!=str(settings)}))
+        raise StudentFacingError('Задача '+INDEX_AGENT_LABEL+' принадлежит другой установке пакета или не из него ('
+                                 +other+'); я её не снимаю. Выполни unschedule-index с её settings.json.')
     if job and launchctl(run,'bootout',target).returncode:
         raise StudentFacingError('launchctl не выгрузил '+INDEX_AGENT_LABEL+'.')
     existed=plist.is_file()

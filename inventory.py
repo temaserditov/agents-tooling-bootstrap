@@ -242,12 +242,27 @@ class ScanBudget:
         return not self.exhausted
 
 
+# Internal tables SQLite virtual tables create for themselves (FTS5, sqlite-vec, sqlite-vss).
+SHADOW_SUFFIX=re.compile(r'_(data|idx|content|docsize|config|chunks|rowids|info|index|auxiliary|'
+                         r'vector_chunks\d+|metadatachunks\d+|metadatatext\d+)$')
+
+
+def copy_bounded(source,target,deadline,clock):
+    """Copy in pieces; False when the scan's time ran out before the end."""
+    with open(source,'rb') as src,open(target,'wb') as dst:
+        while True:
+            if clock()>deadline:return False
+            piece=src.read(4*1024*1024)
+            if not piece:return True
+            dst.write(piece)
+
+
 def file_state(path):
     try:st=os.stat(path);return (st.st_size,st.st_mtime_ns)
     except OSError:return None
 
 
-def sqlite_summary(path,attempts=3):
+def sqlite_summary(path,attempts=3,budget=None):
     """Tables and row counts of a database that stores vectors, else None. Never touches the original.
 
     SQLite opens even read-only WAL bases with side effects (-shm/-wal files), so the main file
@@ -259,17 +274,19 @@ def sqlite_summary(path,attempts=3):
     import sqlite3,tempfile,time
     path=Path(path);wal=Path(str(path)+'-wal')
     unknown=lambda reason:{'rowsKnown':False,'tables':{},'reason':reason}
+    budget=budget or ScanBudget()
     before=(file_state(path),file_state(wal))
     if before[0] is None:return unknown('unreadable')
-    size=before[0][0]+(before[1][0] if before[1] else 0)
-    if size>SQLITE_COPY_BYTES:return unknown('too-large')
     with tempfile.TemporaryDirectory(prefix='agents-inventory-') as tmp:
         copy=Path(tmp)/'copy.sqlite'
         for _ in range(attempts):
+            if before[0] is None:return unknown('unreadable')
+            if before[0][0]+(before[1][0] if before[1] else 0)>SQLITE_COPY_BYTES:return unknown('too-large')
             try:
-                shutil.copyfile(path,copy)
-                if before[1]:shutil.copyfile(wal,Path(str(copy)+'-wal'))
+                done=copy_bounded(path,copy,budget.deadline,budget.clock)
+                if done and before[1]:done=copy_bounded(wal,Path(str(copy)+'-wal'),budget.deadline,budget.clock)
             except OSError:return unknown('unreadable')
+            if not done:budget.exhausted=True;return unknown('time-limit')
             after=(file_state(path),file_state(wal))
             if after==before:break
             before=after
@@ -289,9 +306,10 @@ def sqlite_summary(path,attempts=3):
             virtual=[n for n,sql in rows if re.match(r'(?is)\s*create\s+virtual\s+table',sql or '')]
             tables={};known=True
             for name,sql in rows:
-                # Only the internal shadow tables of a virtual table are left out; every other
-                # table, whatever its name, is counted.
-                if name.startswith('sqlite_') or any(name.startswith(v+'_') for v in virtual):continue
+                # Only the known internal tables of a virtual table (docs_data, vec_chunks...) are
+                # left out; every other table, docs_archive included, is counted.
+                if name.startswith('sqlite_') or any(name.startswith(v+'_') and SHADOW_SUFFIX.fullmatch(name[len(v):])
+                                                     for v in virtual):continue
                 try:tables[name]=db.execute('select count(*) from "'+name.replace('"','""')+'"').fetchone()[0]
                 except sqlite3.Error:tables[name]=None;known=False
             return {'rowsKnown':known,'tables':tables,'vectorTables':sorted(vector)}
@@ -345,16 +363,19 @@ def foreign_knowledge_bases(home,profiles,yaml=None,budget=None):
     # The profiles inventory actually found (also %LOCALAPPDATA%\\hermes or a custom --hermes-home).
     bases=[home/'InfobizAgents',*[Path(p['path']) for p in profiles],
            *[p for p in sorted(home.glob('*')) if p.is_dir() and not p.is_symlink() and KB_HINT.search(p.name)]]
+    hermes_areas=[os.path.normcase(str(Path(p['path']))) for p in profiles]
     for base in bases:
         for here,dirs,files in walk_limited(base,4,budget):
+            in_hermes=any(os.path.normcase(str(here)).startswith(a) for a in hermes_areas)
             if here.name=='tooling' and (here/'student_tools.py').is_file():
                 dirs[:]=[d for d in dirs if d!='kb']
             for name in files:
-                if not name.lower().endswith(DB_SUFFIXES) or name.lower() in HERMES_DB_NAMES:continue
+                # Hermes's own databases are skipped only inside a Hermes profile.
+                if not name.lower().endswith(DB_SUFFIXES) or (in_hermes and name.lower() in HERMES_DB_NAMES):continue
                 path=here/name;key=os.path.normcase(str(path))
                 if key in seen or path.is_symlink():continue
                 if not budget.spend(0):break
-                seen.add(key);summary=sqlite_summary(path)
+                seen.add(key);summary=sqlite_summary(path,budget=budget)
                 if summary is None:continue
                 # Unread contents: a candidate to check by hand, never a confirmed or empty base.
                 kind='sqlite' if summary.get('rowsKnown') else 'sqlite-unchecked'

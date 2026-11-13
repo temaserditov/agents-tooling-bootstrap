@@ -759,6 +759,46 @@ class MacFileBackend(unittest.TestCase):
             self.assertIsNotNone(state['loaded'])
             self.assertTrue(tools.unschedule_index_mac(new,run=run,agents_dir=agents,uid=501)['changed'])
 
+    def test_a_failed_change_gives_back_the_job_launchd_ran(self):
+        import plistlib
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp).resolve();settings=root/'settings.json';settings.write_text('{}');python=root/'python';python.write_bytes(b'')
+            agents=root/'LaunchAgents';state,run=self.launchctl_fake(agents)
+            tools.schedule_index_mac(settings,5,python=python,run=run,agents_dir=agents,uid=501)
+            plist=agents/'com.infobizagents.tooling.kb-index.plist'
+            body,_=tools.launch_agent_plist(python,settings,10);plist.write_bytes(body)  # disk says 10, launchd runs 5
+            calls={'n':0}
+            def first_fails(args,**kw):
+                if args[1]=='bootstrap':
+                    calls['n']+=1
+                    if calls['n']==1:return subprocess.CompletedProcess(args,5)
+                return run(args,**kw)
+            with self.assertRaises(tools.StudentFacingError) as caught:
+                tools.schedule_index_mac(settings,15,python=python,run=first_fails,agents_dir=agents,uid=501)
+            self.assertIn('прежнее состояние возвращено',str(caught.exception))
+            self.assertIn(b'run interval = 300 seconds',state['print'])
+            self.assertEqual(plistlib.loads(plist.read_bytes())['StartInterval'],300)
+
+    def test_a_failing_launchctl_print_is_not_absence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp).resolve();settings=root/'settings.json';settings.write_text('{}');python=root/'python';python.write_bytes(b'')
+            agents=root/'LaunchAgents';_,run=self.launchctl_fake(agents)
+            tools.schedule_index_mac(settings,5,python=python,run=run,agents_dir=agents,uid=501)
+            io_error=lambda args,**kw:subprocess.CompletedProcess(args,5,stdout=b'')
+            with self.assertRaises(tools.StudentFacingError):tools.unschedule_index_mac(settings,run=io_error,agents_dir=agents,uid=501)
+            self.assertTrue((agents/'com.infobizagents.tooling.kb-index.plist').is_file())
+
+    def test_unschedule_keeps_a_plist_that_is_not_ours(self):
+        import plistlib
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp).resolve();settings=root/'settings.json';settings.write_text('{}');python=root/'python';python.write_bytes(b'')
+            agents=root/'LaunchAgents';state,run=self.launchctl_fake(agents)
+            tools.schedule_index_mac(settings,5,python=python,run=run,agents_dir=agents,uid=501)
+            plist=agents/'com.infobizagents.tooling.kb-index.plist'
+            plist.write_bytes(plistlib.dumps({'Label':'com.infobizagents.tooling.kb-index','ProgramArguments':['/usr/bin/true']}))
+            with self.assertRaises(tools.StudentFacingError):tools.unschedule_index_mac(settings,run=run,agents_dir=agents,uid=501)
+            self.assertTrue(plist.is_file())
+
     def test_failed_launchctl_bootstrap_is_reported(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp).resolve();settings=root/'settings.json';settings.write_text('{}');python=root/'python';python.write_bytes(b'')
@@ -935,6 +975,42 @@ class ForeignKnowledgeBases(unittest.TestCase):
             root=Path(tmp).resolve()/'custom-hermes';uv=root/'tools/uv-0.13.5-darwin-arm64/uv';uv.parent.mkdir(parents=True)
             uv.write_text('#!/bin/sh\n');uv.chmod(0o755)
             self.assertEqual(self.inventory.hermes_uv(root),[str(uv)])
+
+    def test_an_ordinary_table_sharing_a_virtual_prefix_is_counted(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as tmp:
+            home=Path(tmp).resolve();folder=home/'InfobizAgents/x';folder.mkdir(parents=True)
+            db=sqlite3.connect(folder/'kb.db');db.execute('create virtual table docs using fts5(body)')
+            db.execute('create table docs_archive(id integer primary key,embedding blob)')
+            db.execute("insert into docs_archive(embedding) values(x'00')");db.commit();db.close()
+            entry=next(x for x in self.inventory.foreign_knowledge_bases(home,[]) if x['kind']=='sqlite')
+            self.assertEqual(entry['tables'],{'docs':0,'docs_archive':1})
+
+    def test_hermes_names_outside_hermes_are_still_checked(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as tmp:
+            home=Path(tmp).resolve();folder=home/'InfobizAgents/customer-kb';folder.mkdir(parents=True)
+            db=sqlite3.connect(folder/'projects.db');db.execute('create table t(embedding blob)');db.commit();db.close()
+            self.assertEqual([x['kind'] for x in self.inventory.foreign_knowledge_bases(home,[])],['sqlite'])
+
+    def test_a_slow_copy_stops_at_the_scan_deadline(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as tmp:
+            home=Path(tmp).resolve();folder=home/'InfobizAgents/slow';folder.mkdir(parents=True)
+            db=sqlite3.connect(folder/'a.db');db.execute('create table t(embedding blob)');db.commit();db.close()
+            now={'t':0.0}
+            def clock():now['t']+=30;return now['t']
+            budget=self.inventory.ScanBudget(seconds=45,clock=clock)
+            found=self.inventory.foreign_knowledge_bases(home,[],budget=budget)
+            self.assertEqual(found[-1]['kind'],'scan-incomplete')
+            self.assertFalse(any(x.get('rowsKnown') for x in found))
+
+    def test_copy_itself_obeys_the_deadline(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as tmp:
+            base=Path(tmp).resolve()/'a.db';db=sqlite3.connect(base);db.execute('create table t(embedding blob)');db.commit();db.close()
+            budget=self.inventory.ScanBudget(seconds=-1)
+            self.assertEqual(self.inventory.sqlite_summary(base,budget=budget)['reason'],'time-limit');self.assertTrue(budget.exhausted)
 
 
 if __name__=='__main__':unittest.main()

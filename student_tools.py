@@ -43,8 +43,10 @@ BGE_M3_DIGEST='7907646426070047a77226ac3e684fbbe8410524f7b4a74d02837e43f2146bab'
 RETRY_ATTEMPTS=4
 RETRY_PAUSE_SECONDS=5
 IS_WINDOWS=os.name=='nt'
-# Knowledge-base backends. postgres: Mac/Ubuntu (PostgreSQL/pgvector + Ollama), the default.
-# file: Windows, no services at all: bge-m3 runs in-process through ONNX Runtime and the
+IS_MAC=sys.platform=='darwin'
+# Knowledge-base backends. postgres: Ubuntu, and Mac on macOS 15 with a working Homebrew
+# (PostgreSQL/pgvector + Ollama), the default. file: Windows and every other Apple Silicon
+# Mac (macOS 14+), no services at all: bge-m3 runs in-process through ONNX Runtime and the
 # index is one SQLite file. Same model, same 1024 dimensions, same search contract.
 BACKENDS=('postgres','file')
 # The official ONNX export of BAAI/bge-m3 (onnx/ folder of the model repository). Its
@@ -63,6 +65,10 @@ KB_SCHEMA_VERSION='1'
 # The MCP server frees the in-process model after this idle time (Ollama keep_alive 2m).
 EMBED_KEEP_ALIVE_SECONDS=120
 INDEX_TASK_NAME='AgentsTooling-KB-Index'
+# Mac: the LaunchAgent of this user that refreshes the index (schedule-index).
+INDEX_AGENT_LABEL='com.infobizagents.tooling.kb-index'
+# The ONNX Runtime wheels of the lock exist for Apple Silicon and macOS 14+ only.
+MAC_FILE_MIN_MAJOR=14
 ARM_REFUSAL='Windows ARM пока не поддерживается: только диагностика'
 # Secret-like names are skipped in any letter case on every OS (.env, AUTH.JSON, Secrets/).
 SECRET_NAMES={'.env','auth.json','credentials','secrets','cookies','.ssh','.gnupg','.netrc','.pgpass',
@@ -264,12 +270,14 @@ def config(path):
         raise ValueError('Review embedding schema before changing model or dimensions')
     kind=d.get('backend','postgres')
     if kind not in BACKENDS:
-        raise StudentFacingError('В settings.json backend — postgres (Mac/Ubuntu) или file (Windows).')
+        raise StudentFacingError('В settings.json backend — postgres (Ubuntu, Mac с PostgreSQL) или file (Windows, Mac).')
     if kind=='postgres' and IS_WINDOWS:
         raise StudentFacingError('На Windows используется backend file: база знаний — один файл SQLite, '
                                  'модель bge-m3 работает внутри процесса (ONNX), без PostgreSQL и Ollama. '
                                  'Укажи в settings.json "backend": "file", kbFile, embeddingModelDir и embeddingRevision.')
-    if kind=='file':file_settings(d)
+    if kind=='file':
+        if IS_MAC:mac_file_supported()
+        file_settings(d)
     if any(k in d.get('database',{}) for k in ['password','dsn','connectionString','host']):
         raise StudentFacingError('В settings.json для базы знаний не должно быть пароля, строки подключения или host: '
                                  'агенты подключаются через локальный сокет (database.socket) с peer-аутентификацией.')
@@ -515,9 +523,26 @@ def search(cfg,query,profile='tech',project='__skills__',limit=6):
 
 
 # ---------------------------------------------------------------------------------------
-# backend "file" (Windows): no services. bge-m3 through ONNX Runtime inside this process,
+# backend "file" (Windows, Mac): no services. bge-m3 through ONNX Runtime inside this process,
 # the index in one SQLite file (stdlib sqlite3: FTS5, WAL; vectors as float32 BLOBs).
 # ---------------------------------------------------------------------------------------
+
+def mac_version(text=None):
+    """(major, minor) of macOS, (0, 0) when unknown."""
+    text=platform.mac_ver()[0] if text is None else text
+    parts=[int(x) for x in re.findall(r'\d+',text or '')[:2]]
+    return tuple(parts+[0]*(2-len(parts))) if parts else (0,0)
+
+
+def mac_file_supported(version=None,machine=None):
+    """Mac, backend file: Apple Silicon with a native arm64 Python, macOS 14 or newer."""
+    machine=platform.machine() if machine is None else machine
+    if machine!='arm64':
+        raise StudentFacingError('База знаний на Mac работает только на Apple Silicon с Python для arm64 '
+                                 '(на Intel Mac и под Rosetta нет нужных сборок). Остановись и скажи ученику.')
+    if mac_version(version)<(MAC_FILE_MIN_MAJOR,0):
+        raise StudentFacingError('База знаний на Mac нужна macOS 14 или новее. Остановись и скажи ученику.')
+
 
 def file_settings(d):
     """Validate the file-backend part of settings.json: absolute paths, pinned revision, no secrets."""
@@ -984,13 +1009,19 @@ def file_doctor(cfg):
             'embeddingDimensions':len(vector),'local':True,'warnings':warnings}
 
 
+def write_status(status_file,body):
+    """One small JSON file with the last run (bounded log); runId tells a new run from an old one."""
+    status_file=guard(status_file)
+    stage=status_file.with_name('.'+status_file.name+'.'+uuid.uuid4().hex[:8])
+    stage.write_text(json.dumps({'finishedAt':time.strftime('%Y-%m-%dT%H:%M:%S%z'),'runId':uuid.uuid4().hex,**body},
+                                ensure_ascii=False),encoding='utf-8')
+    os.replace(stage,status_file)
+
+
 def index_with_status(cfg,status_file,progress=None):
     """index() for the scheduled task: the last result goes to one small JSON file (bounded log)."""
     status_file=guard(status_file)
-    def write(body):
-        stage=status_file.with_name('.'+status_file.name+'.'+uuid.uuid4().hex[:8])
-        stage.write_text(json.dumps({'finishedAt':time.strftime('%Y-%m-%dT%H:%M:%S%z'),**body},ensure_ascii=False),encoding='utf-8')
-        os.replace(stage,status_file)
+    def write(body):write_status(status_file,body)
     try:result=file_index(cfg,progress) if cfg.get('backend')=='file' else index(cfg)
     except StudentFacingError as error:write({'status':'index-failed','errorClass':'StudentFacingError','message':str(error)});raise
     except Exception as error:write({'status':'index-pending','errorClass':type(error).__name__});raise
@@ -1042,16 +1073,24 @@ def schtasks(run,*args):
     return run(['schtasks',*args],capture_output=True,stdin=subprocess.DEVNULL)
 
 
-def schedule_index(settings,interval_minutes=5,python=None,run=subprocess.run,windows=None):
+def check_interval(interval_minutes):
+    if not isinstance(interval_minutes,int) or isinstance(interval_minutes,bool) or not 1<=interval_minutes<=1440:
+        raise StudentFacingError('Интервал обновления индекса — от 1 до 1440 минут (не чаще раза в минуту).')
+
+
+def schedule_index(settings,interval_minutes=5,python=None,run=subprocess.run,windows=None,mac=None):
     """Windows: a scheduled task of this user (no administrator) runs `index` every N minutes.
+    Mac: a LaunchAgent of this user does the same (schedule_index_mac).
 
     No process stays running between runs. Idempotent: the same definition is not re-registered.
     """
-    if not (IS_WINDOWS if windows is None else windows):
-        raise StudentFacingError('schedule-index — только для Windows. На Mac/Ubuntu обновление индекса — служба '
-                                 'с watch (LaunchAgent/systemd), см. раздел 5.')
-    if not isinstance(interval_minutes,int) or not 1<=interval_minutes<=1440:
-        raise StudentFacingError('Интервал обновления индекса — от 1 до 1440 минут (не чаще раза в минуту).')
+    windows=IS_WINDOWS if windows is None else windows
+    if not windows and (IS_MAC if mac is None else mac):
+        return schedule_index_mac(settings,interval_minutes,python=python,run=run)
+    if not windows:
+        raise StudentFacingError('schedule-index — для Windows и Mac. На Ubuntu обновление индекса — служба '
+                                 'с watch (systemd), см. раздел 5.')
+    check_interval(interval_minutes)
     settings=guard(settings);task=index_task_name()
     # pythonw.exe of this venv: no console window pops up every few minutes.
     python=Path(python) if python else Path(sys.executable).with_name('pythonw.exe')
@@ -1080,8 +1119,153 @@ def schedule_index(settings,interval_minutes=5,python=None,run=subprocess.run,wi
     return {'changed':True,**result}
 
 
-def unschedule_index(settings,run=subprocess.run,windows=None):
-    if not (IS_WINDOWS if windows is None else windows):raise StudentFacingError('unschedule-index — только для Windows.')
+def launch_agent_plist(python,settings,interval_minutes,label=INDEX_AGENT_LABEL,tools=None):
+    """The LaunchAgent: `index` every N minutes in the background, nothing stays running."""
+    import plistlib
+    settings=Path(settings);status=settings.parent/'index-status.json'
+    body={'Label':label,
+          'ProgramArguments':[str(python),'-B',str(tools or Path(__file__).resolve()),'--config',str(settings),
+                              'index','--status-file',str(status)],
+          'StartInterval':int(interval_minutes)*60,'RunAtLoad':False,
+          # Background: throttled CPU and disk, like a Windows task of an idle user.
+          'ProcessType':'Background','LowPriorityIO':True,'Nice':10,
+          # The result is index-status.json (one small file); no growing log.
+          'StandardInPath':'/dev/null','StandardOutPath':'/dev/null','StandardErrorPath':'/dev/null',
+          'WorkingDirectory':str(settings.parent)}
+    return plistlib.dumps(body,fmt=plistlib.FMT_XML,sort_keys=True),status
+
+
+def launchctl(run,*args):
+    return run(['/bin/launchctl',*args],capture_output=True,stdin=subprocess.DEVNULL)
+
+
+def loaded_job(run,target):
+    """What launchd actually runs for the label: {} when not loaded, None when unreadable.
+
+    From `launchctl print`: the plist path, the run interval and the program arguments.
+    """
+    done=launchctl(run,'print',target)
+    # 113: launchd has no such service. Any other failure is an unknown state, not "absent".
+    if done.returncode==113:return {}
+    if done.returncode:return None
+    out=done.stdout.decode('utf-8','replace') if isinstance(done.stdout,bytes) else (done.stdout or '')
+    path=re.search(r'(?m)^\s*path = (.+)$',out);interval=re.search(r'(?m)^\s*run interval = (\d+) seconds',out)
+    block=re.search(r'(?ms)^\s*arguments = \{\n(.*?)^\s*\}',out)
+    if not path:return None
+    args=[line.strip() for line in block.group(1).splitlines() if line.strip()] if block else []
+    return {'path':path.group(1).strip(),'interval':int(interval.group(1)) if interval else None,'arguments':args}
+
+
+def plist_settings(plist):
+    """--config of a LaunchAgent plist written by this package, or None."""
+    import plistlib
+    try:args=plistlib.loads(Path(plist).read_bytes()).get('ProgramArguments',[])
+    except Exception:return None
+    return args[args.index('--config')+1] if '--config' in args[:-1] else None
+
+
+def job_settings(job):
+    args=(job or {}).get('arguments') or []
+    return args[args.index('--config')+1] if '--config' in args[:-1] else None
+
+
+def schedule_index_mac(settings,interval_minutes=5,python=None,run=subprocess.run,agents_dir=None,uid=None):
+    """Mac: ~/Library/LaunchAgents/com.infobizagents.tooling.kb-index.plist of this user.
+
+    launchd starts `index` every N minutes and never a second copy while one runs; a sleeping
+    Mac catches up once after waking. No administrator, no daemon, no resident process.
+    "No change" is reported only when launchd itself runs exactly this definition; a failed
+    reload puts the previous definition back and says whether that worked.
+    """
+    import plistlib
+    check_interval(interval_minutes)
+    settings=guard(settings)
+    python=Path(python) if python else Path(sys.executable)
+    if not python.is_file():raise StudentFacingError('Нет Python этого venv: '+str(python))
+    uid=os.getuid() if uid is None else uid
+    agents=Path(agents_dir) if agents_dir else Path.home()/'Library/LaunchAgents'
+    plist=guard(agents/(INDEX_AGENT_LABEL+'.plist'))
+    body,status=launch_agent_plist(python,settings,interval_minutes)
+    wanted=plistlib.loads(body)['ProgramArguments']
+    target=f'gui/{uid}/{INDEX_AGENT_LABEL}'
+    result={'task':INDEX_AGENT_LABEL,'plist':str(plist),'intervalMinutes':interval_minutes,'statusFile':str(status),
+            'runNow':'launchctl kickstart '+target}
+    job=loaded_job(run,target)
+    if job and job['path']==str(plist) and job['interval']==interval_minutes*60 and job['arguments']==wanted \
+       and plist.is_file() and plist.read_bytes()==body:
+        return {'changed':False,**result}
+    if job is None:raise StudentFacingError('Не удалось прочитать состояние '+INDEX_AGENT_LABEL+' в launchctl; ничего не изменено.')
+    if job and job_settings(job) not in (None,str(settings)) and job['path']!=str(plist):
+        raise StudentFacingError('Задача '+INDEX_AGENT_LABEL+' загружена другой установкой ('+str(job_settings(job))+'); '
+                                 'сначала выполни unschedule-index с её settings.json.')
+    # What launchd runs now is what a failed change must give back: rebuilt from the loaded
+    # job when it is ours (the plist is deterministic), else the file on disk.
+    previous=plist.read_bytes() if plist.is_file() else None
+    if job and job_settings(job) and job['interval'] and len(job['arguments'])==8 and job['arguments'][1]=='-B':
+        previous,_=launch_agent_plist(job['arguments'][0],job_settings(job),job['interval']//60,tools=job['arguments'][2])
+    agents.mkdir(parents=True,exist_ok=True)
+    # The new definition is written next to the plist first: a failure here changes nothing.
+    stage=plist.with_name('.'+plist.name+'.'+uuid.uuid4().hex[:8])
+    try:stage.write_bytes(body);stage.chmod(0o644)  # launchd refuses a plist that others can write
+    except OSError:
+        if stage.exists():stage.unlink()
+        raise StudentFacingError('Не удалось записать '+str(plist)+'; ничего не изменено.')
+    if job and launchctl(run,'bootout',target).returncode:
+        stage.unlink();raise StudentFacingError('launchctl не выгрузил прежнюю задачу '+INDEX_AGENT_LABEL+'; ничего не изменено.')
+    def restore():
+        """Back to the previous definition; True when launchd runs it again (or there was none)."""
+        try:
+            if previous is None:
+                if plist.exists():plist.unlink()
+                return not job
+            back=plist.with_name('.'+plist.name+'.'+uuid.uuid4().hex[:8]);back.write_bytes(previous);back.chmod(0o644)
+            os.replace(back,plist)
+        except OSError:return False
+        if not job:return True
+        if launchctl(run,'bootstrap',f'gui/{uid}',str(plist)).returncode:return False
+        again=loaded_job(run,target)
+        return bool(again) and again.get('arguments')==job.get('arguments') and again.get('interval')==job.get('interval')
+    try:os.replace(stage,plist)
+    except OSError:
+        stage.unlink();ok=restore()
+        raise StudentFacingError('Не удалось заменить '+str(plist)+'; '+('прежняя задача возвращена.' if ok else
+                                 'прежняя задача сейчас НЕ загружена: выполни schedule-index ещё раз.'))
+    done=launchctl(run,'bootstrap',f'gui/{uid}',str(plist))
+    if done.returncode:
+        ok=restore()
+        raise StudentFacingError(f'launchctl не загрузил {INDEX_AGENT_LABEL} (код {done.returncode}); '
+                                 +('прежнее состояние возвращено. ' if ok else 'прежняя задача сейчас НЕ загружена. ')
+                                 +'Запусти от пользователя, который вошёл в macOS и от которого работают агенты; '
+                                 'права администратора не нужны.')
+    return {'changed':True,**result}
+
+
+def unschedule_index_mac(settings,run=subprocess.run,agents_dir=None,uid=None):
+    """Removes the LaunchAgent only when it belongs to these settings (a moved install keeps its job)."""
+    settings=guard(settings)
+    uid=os.getuid() if uid is None else uid
+    agents=Path(agents_dir) if agents_dir else Path.home()/'Library/LaunchAgents'
+    plist=guard(agents/(INDEX_AGENT_LABEL+'.plist'));target=f'gui/{uid}/{INDEX_AGENT_LABEL}'
+    job=loaded_job(run,target)
+    if job is None:raise StudentFacingError('Не удалось прочитать состояние '+INDEX_AGENT_LABEL+' в launchctl; я её не снимаю.')
+    # The file and the loaded job are checked on their own: each must belong to these settings.
+    file_owner=plist_settings(plist) if plist.is_file() else str(settings)
+    job_owner=job_settings(job) if job else str(settings)
+    if file_owner!=str(settings) or job_owner!=str(settings):
+        other=', '.join(sorted({str(o) for o in (file_owner,job_owner) if o!=str(settings)}))
+        raise StudentFacingError('Задача '+INDEX_AGENT_LABEL+' принадлежит другой установке пакета или не из него ('
+                                 +other+'); я её не снимаю. Выполни unschedule-index с её settings.json.')
+    if job and launchctl(run,'bootout',target).returncode:
+        raise StudentFacingError('launchctl не выгрузил '+INDEX_AGENT_LABEL+'.')
+    existed=plist.is_file()
+    if existed:plist.unlink()
+    return {'changed':bool(job) or existed,'task':INDEX_AGENT_LABEL}
+
+
+def unschedule_index(settings,run=subprocess.run,windows=None,mac=None):
+    windows=IS_WINDOWS if windows is None else windows
+    if not windows and (IS_MAC if mac is None else mac):return unschedule_index_mac(settings,run=run)
+    if not windows:raise StudentFacingError('unschedule-index — для Windows и Mac.')
     settings=guard(settings);state=settings.parent/'index-task.json';task=index_task_name()
     exists=schtasks(run,'/Query','/TN',task).returncode==0
     if exists:
@@ -1266,7 +1450,14 @@ def main():
     if a.command=='transcribe':print(dump_json(transcribe(a.model_dir,a.audio,a.output),ensure_ascii=False));return
     if a.command=='fetch-whisper-model':print(dump_json(fetch_whisper_model(a.model_dir),ensure_ascii=False));return
     if a.command=='fetch-embedding-model':print(dump_json(fetch_embedding_model(a.model_dir),ensure_ascii=False));return
-    cfg=config(a.config)
+    try:cfg=config(a.config)
+    except Exception as error:
+        # A scheduled run must leave a fresh status even when settings are refused.
+        if a.command=='index' and a.status_file:
+            body={'status':'index-failed','errorClass':type(error).__name__}
+            if isinstance(error,StudentFacingError):body['message']=str(error)
+            write_status(a.status_file,body)
+        raise
     if a.command=='model-check':print(dump_json(model_check(cfg)));return
     if a.command=='index':
         progress=None
@@ -1291,6 +1482,10 @@ def main():
         if IS_WINDOWS:
             raise StudentFacingError('На Windows постоянный процесс watch не используется: индекс обновляет '
                                      'запланированная задача (schedule-index).')
+        if cfg.get('backend')=='file':
+            # The in-process model would stay in memory for good; a periodic run frees it.
+            raise StudentFacingError('С backend file постоянный процесс watch не используется: индекс обновляет '
+                                     'schedule-index (на Mac — LaunchAgent, на Windows — задача планировщика).')
         if a.interval<60:raise ValueError('Polling must not run more than once a minute')
         while True:
             try:index(cfg)

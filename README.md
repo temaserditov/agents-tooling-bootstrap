@@ -17,14 +17,18 @@ Codex получает пакет с закреплённым SHA-256, пров�
 ## Состав
 
 - inventory.py — обнаружение ОС, версии Hermes, команд и профилей, без чтения авторизации;
+  на Mac — выбор базы знаний (`mac.kbBackend`); поиск самодельных баз знаний
+  (`otherKnowledgeBases`, только имена и счётчики);
 - bootstrap.py — автоматическая регистрация полученных скиллов/справок/контекста,
   добавление MCP и первое индексирование без замены других подключений;
-- student_tools.py — локальные embeddings, PostgreSQL/pgvector (Mac/Ubuntu) или файл
-  SQLite с bge-m3 через ONNX внутри процесса (Windows x64, backend `file`, без служб),
-  гибридный поиск, stdio MCP, индексатор/watch (на Windows — задача планировщика),
+- student_tools.py — локальные embeddings, PostgreSQL/pgvector (Ubuntu, Mac на macOS 15) или
+  файл SQLite с bge-m3 через ONNX внутри процесса (backend `file`, без служб: Windows x64 и
+  Mac Apple Silicon на macOS 14, 26, 27+), гибридный поиск, stdio MCP, индексатор/watch
+  (с backend `file` — задача планировщика Windows или LaunchAgent Mac),
   offline Whisper consumer и Bitwarden consumer;
 - schema.sql — основа новой собственной базы с vector(1024), не дамп чужой БД;
-- settings.example.json (Mac/Ubuntu) и settings.windows.example.json (Windows x64);
+- settings.example.json (PostgreSQL), settings.windows.example.json (Windows x64) и
+  settings.mac-file.example.json (Mac, backend `file`);
 - requirements*.lock — закреплённые зависимости с хешами;
 - browser-smoke.py — отдельный headless профиль и синтетическая страница: на Hermes 0.23+
   через собственный Chromium Hermes, на старых версиях через agent-browser;

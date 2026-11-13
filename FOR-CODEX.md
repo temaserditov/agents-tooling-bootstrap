@@ -32,6 +32,18 @@ Telegram Reader исключён: не устанавливай/не переа�
 с поправками раздела 10 «Windows x64»: там база знаний работает без PostgreSQL, Ollama и
 без служб. Раздел 10 главнее разделов 1–9 везде, где они расходятся.
 
+Если агенты стоят на Mac — базу знаний выбирает inventory.py, а не ты: поле `mac.kbBackend`
+(раздел 11). `postgres` — разделы 4–5 как написано; `file` — раздел 11 (без PostgreSQL,
+Ollama, Homebrew и служб); `null` — Intel Mac или macOS 13 и старше: базу знаний не ставь,
+скажи мне. Если на пути `postgres` что-то не ставится (Homebrew ругается на версию macOS,
+нет готовой сборки и он начинает собирать из исходников, pgvector или Ollama не работают) —
+не чини это обходными путями, переходи на раздел 11.
+
+**Никогда не собирай свою базу знаний** (свой SQLite с векторами, sqlite-vec, Chroma, свой
+скрипт или навык поиска) вместо этого пакета — ни при какой ошибке. Если ни один путь
+пакета не подходит, остановись и скажи мне, что именно не встало. Если такая самодельная
+база уже есть на компьютере (её мог собрать прошлый запуск) — раздел 12.
+
 Если агенты стоят на Windows на ARM64 — ОСТАНОВИСЬ и скажи мне: на Windows ARM64
 дооснащение не поддерживается, ничего не устанавливай.
 Если Windows — только мой компьютер для работы с Ubuntu VPS, ставь всё на VPS.
@@ -45,9 +57,10 @@ Telegram Reader исключён: не устанавливай/не переа�
 
 | ОС | Статус |
 |---|---|
-| macOS 14–15, Apple Silicon | поддерживается; проверено в виртуальной машине (macOS 15) |
+| macOS 15, Apple Silicon, рабочий Homebrew | база знаний PostgreSQL + Ollama (разделы 4–5); проверено в виртуальной машине (macOS 15) |
+| macOS 14, 26, 27 и новее, Apple Silicon; macOS 15 без Homebrew | база знаний — файл SQLite + bge-m3 внутри процесса, без служб (раздел 11); проверено в виртуальной машине macOS 15 (официальный Hermes 0.23.0) и на macOS 27; macOS 14 и 26 отдельно не проверялись |
+| macOS 13 и старше; Mac на Intel | база знаний НЕ ставится (нет сборок PostgreSQL/Ollama/ONNX Runtime): скажи мне |
 | Ubuntu 24.04 VPS, x86_64/arm64 | поддерживается; проверено в виртуальной машине (Ubuntu 24.04) |
-| macOS на Intel | код тот же, отдельно не проверялся |
 | Windows 10/11 x64 (официальный Hermes, Windows v3) | поддерживается по разделу 10 (база знаний — файл SQLite + bge-m3 через ONNX, без служб); проверено на GitHub windows-2025 (Windows Server, синтетические профили): модель, индекс, русский поиск, MCP, задача планировщика, Whisper без сети, bws, headless-браузер |
 | Windows на ARM64 | НЕ поддерживается: ничего не ставь, скажи мне |
 | Windows → VPS | всё ставится на Ubuntu VPS, не на Windows клиента |
@@ -153,6 +166,8 @@ Keychain/другое хранилище вместо Bitwarden молча. По
 нужные конкретному исполнителю. Не создавай ключи сторонних сервисов самовольно.
 
 ## 4. Локальная векторная база как у нашей команды
+
+Этот раздел — для Ubuntu и для Mac с `mac.kbBackend: postgres`. Mac с `file` — раздел 11.
 
 Нужны PostgreSQL, расширение pgvector, локальный Ollama, модель `bge-m3`,
 1024 измерения. Это не облачный embeddings API и не папка Obsidian.
@@ -302,7 +317,8 @@ bootstrap запускай без Bitwarden и без `--via-vault`: база з
 переиндексирует только изменённый текст и мягко архивирует исчезнувшие/исключённые
 источники. Исходные файлы не удаляются, прежние записи остаются в истории.
 Настрой отдельную управляемую службу под пользователем: LaunchAgent на Mac,
-systemd на Ubuntu. Не используй cron каждую минуту
+systemd на Ubuntu. С backend `file` (Windows, раздел 11 на Mac) `watch` не используется —
+индекс обновляет `schedule-index`. Не используй cron каждую минуту
 и не оставляй бесконтрольный процесс терминала. Сохраняй очищенный журнал,
 ограничь его размер. Если после reboot недоступен Bitwarden, состояние должно
 быть «нужен unlock», а не «всё работает».
@@ -650,3 +666,164 @@ Hermes (`%LOCALAPPDATA%\hermes\installs\...\venv\Scripts\python.exe`); inventory
 8. Ни один секрет не попал в TOOLING, в файл базы и в инструкции профилей.
 
 В tooling/report.md отметь отдельно, что проверено на этом компьютере, а что — нет.
+
+## 11. Mac: база знаний без PostgreSQL (backend `file`)
+
+**Когда.** inventory.py на Mac печатает объект `mac`. Этот раздел — когда `mac.kbBackend`
+равен `file`, либо путь `postgres` (раздел 4) не встал. Причина в `mac.kbBackendReason`:
+
+| Причина | Что это |
+|---|---|
+| `macos-newer-than-verified-postgres` | macOS 26, 27 и новее: путь PostgreSQL этим пакетом проверен только на macOS 15 |
+| `macos14-no-homebrew-bottles` | macOS 14: Homebrew больше не выпускает для неё готовых сборок PostgreSQL и собирает из исходников часами |
+| `no-homebrew` | macOS 15 без Homebrew в `/opt/homebrew` |
+| `intel-mac-unsupported`, `macos-older-than-14-unsupported` (`kbBackend: null`) | база знаний не ставится: остановись и скажи мне |
+
+Если на этом Mac база знаний этого пакета уже стоит на PostgreSQL от прошлого выпуска и
+`doctor` с её settings.json проходит, а агенты находят через `agent_kb_search` — ничего не
+переводи на `file`: оставь работающую базу и обнови пакет по разделу 2 («Обновление с прошлого
+выпуска»). Раздел 11 — для новой установки или когда PostgreSQL не встал.
+
+**Что это.** То же, что на Windows (раздел 10, «Почему здесь по-другому»): модель bge-m3,
+1024 измерения, официальный ONNX-экспорт `BAAI/bge-m3` ревизии
+`5617a9f61b028005a4858fdac845db406aefb181`, считается внутри процесса `student_tools.py`
+на процессоре; база — один файл SQLite (FTS5, WAL); поиск тот же гибридный; MCP тот же —
+`student-agent-kb`, инструмент `agent_kb_search`. Нет PostgreSQL, Ollama, Homebrew, служб,
+паролей и прав администратора. На Mac ничего из раздела 10.1–10.4, кроме описанного ниже,
+не делай (там Windows-команды).
+
+**Место и память.** Модель — 2,3 ГБ, Whisper small — около 0,5 ГБ, venv — около 0,5 ГБ, плюс
+индекс (текст материалов и 4 КБ на фрагмент): около 3,5 ГБ без индекса — назови точную оценку
+до установки. Во время индексации и поиска модель занимает около 3 ГБ ОЗУ; MCP-процесс каждого
+агента освобождает её через 2 минуты простоя. Одновременный поиск у нескольких агентов — кратно
+больше памяти. На Mac с 8 ГБ ОЗУ предупреди меня.
+
+### 11.1. Python и venv
+
+Нужен Python 3.11–3.13 для arm64 с SQLite FTS5 (3.14 не подходит: под него нет закреплённых
+сборок). inventory.py уже проверил подходящие и перечислил их в `mac.venvPythonCandidates`
+(лучший первый). Если список пуст — возьми `uv` из поля `mac.uv` (его ставит сам Hermes, обычно
+`~/.hermes/tools/uv-<версия>-darwin-arm64/uv`), выполни `UV python install 3.12` (UV — этот
+путь; Python ставится в папку моего пользователя, без пароля) и снова запусти inventory.py.
+Если и `mac.uv` пустой — скажи мне (официальный установщик python.org требует моего пароля
+администратора). Python самого Hermes (`hermesPython`) для venv пакета не используй:
+он меняется при обновлении Hermes. Системный `/usr/bin/python3` (3.9) не подходит.
+
+`TOOLING` — `~/InfobizAgents/tooling` (абсолютный путь), `BASE` — первый из
+`mac.venvPythonCandidates`:
+
+```bash
+BASE -m venv TOOLING/venv
+TOOLING/venv/bin/python -m pip install --require-hashes -r requirements.lock
+TOOLING/venv/bin/python -m pip install --require-hashes -r requirements-whisper.lock
+TOOLING/venv/bin/python -m pip check
+TOOLING/venv/bin/python -B inventory.py
+```
+
+Оба lock-файла ставятся в ОДИН venv (в requirements-whisper.lock — onnxruntime, tokenizers,
+numpy). Дальше `PY` — `TOOLING/venv/bin/python`, `SETTINGS` — `TOOLING/settings.json`.
+settings.json сделай по образцу `settings.mac-file.example.json`: `"backend": "file"`,
+`kbFile` — `TOOLING/kb/agents-student-kb.sqlite`, `embeddingModelDir` —
+`TOOLING/models/bge-m3-onnx`, пути абсолютные, с моим настоящим именем пользователя. Раздела
+`database`, `ollamaUrl`, паролей и токенов в нём нет.
+
+### 11.2. Модель, подключение, первая индексация
+
+```bash
+PY -B student_tools.py fetch-embedding-model --model-dir TOOLING/models/bge-m3-onnx
+PY -B student_tools.py fetch-embedding-model --model-dir TOOLING/models/bge-m3-onnx
+PY -B student_tools.py --config SETTINGS model-check
+PY -B student_tools.py --config SETTINGS doctor
+PY -B bootstrap.py --hermes-home HERMES_HOME --settings SETTINGS --inspect
+PY -B bootstrap.py --hermes-home HERMES_HOME --settings SETTINGS
+PY -B student_tools.py --config SETTINGS index --status-file TOOLING/index-status.json --progress
+PY -B student_tools.py --config SETTINGS search "запрос по-русски" --profile tech --project __skills__
+PY -B bootstrap.py --hermes-home HERMES_HOME --settings SETTINGS --index
+```
+
+`HERMES_HOME` — папка Hermes, в которой inventory.py нашёл профили (поле `path` профиля без
+`/profiles/<имя>`; обычно `~/.hermes`). Всё как в 10.2–10.3: второй fetch — `"changed": false`, несовпадение SHA-256 — ЖЁСТКИЙ ОТКАЗ;
+bootstrap сам создаёт схему в `kbFile` (psql, schema.sql, grants.sql не нужны); первую
+индексацию — на переднем плане с `--progress` (на процессоре это может занять часы); последний
+bootstrap с `--index` ничего не переиндексирует. MCP-клиент Hermes, `hermes mcp test` у каждого
+профиля и реальный вызов поиска у агента — как в разделе 4.
+
+### 11.3. Обновление индекса — LaunchAgent
+
+`watch` с backend `file` отказывается работать (модель висела бы в памяти постоянно). Индекс
+обновляет LaunchAgent моего пользователя (без администратора):
+
+```bash
+PY -B student_tools.py --config SETTINGS schedule-index --interval-minutes 5
+PY -B student_tools.py --config SETTINGS schedule-index --interval-minutes 5
+launchctl print gui/$(id -u)/com.infobizagents.tooling.kb-index
+cat TOOLING/index-status.json
+launchctl kickstart gui/$(id -u)/com.infobizagents.tooling.kb-index
+cat TOOLING/index-status.json
+```
+
+schedule-index пишет `~/Library/LaunchAgents/com.infobizagents.tooling.kb-index.plist` и
+загружает его: `index --status-file TOOLING/index-status.json` раз в N минут (от 1 до 1440),
+в фоновом режиме с пониженным приоритетом; launchd не запускает второй экземпляр, пока идёт
+первый; после сна Mac догоняет одним запуском; процесс между запусками не висит. Повторный
+schedule-index — `"changed": false`. Запускай его из обычной сессии моего пользователя (в
+которой я вошёл в macOS), не через sudo. Проверка фонового запуска: запомни `runId` в
+`index-status.json` до kickstart и дождись НОВОГО `runId` (с маленьким изменением в материалах —
+секунды, с крупным — дольше); в нём должно быть `"status": "ok"`, а в `launchctl print` —
+`last exit code = 0`. Старый `ok` от ручной индексации фоновый запуск не подтверждает. Убрать: `PY -B student_tools.py --config
+SETTINGS unschedule-index`. Свой LaunchAgent с `watch` для file не делай.
+
+Фоновые процессы macOS не читают папки «Документы», «Рабочий стол», «Загрузки» и iCloud
+Drive без отдельного разрешения. Материалы агентов (`~/.hermes/profiles/...`) и
+`~/InfobizAgents` под это не попадают. Если я прошу проиндексировать проект из «Документов»,
+скажи мне: либо папку проекта лучше держать в `~/InfobizAgents/projects`, либо нужно моё
+разрешение «Доступ к диску» для Python этого venv (Системные настройки → Конфиденциальность
+и безопасность). Сам это разрешение не включай.
+
+### 11.4. Приёмка на Mac с backend `file`
+
+Пункты 1–5 и 8 из 10.6 (вместо `schtasks` — `launchctl kickstart` и `index-status.json` со
+`status: ok`; в `doctor` — `backend: file`), плюс раздел 9 (Whisper, браузер, Bitwarden — как
+на Mac обычно). Что проверено разработчиком пакета: виртуальная машина macOS 15.7 (официальный Hermes 0.23.0, синтетические профили, backend `file` принудительно) — загрузка модели с SHA-256, индекс, русский поиск, изменение/удаление/соседний проект, реальный MCP-вызов и `hermes mcp test` у двух профилей, LaunchAgent (новый `runId`, `last exit code = 0`), отсутствие секрета-приманки; macOS 27.0.1 — тот же путь во временной папке с настоящим launchd. Не проверялись: macOS 14 и 26, настоящий профиль ученика после установщика курса, Mac с 8 ГБ ОЗУ. В tooling/report.md
+отметь, что база знаний — backend `file`, и почему (`mac.kbBackendReason`).
+
+## 12. Если на компьютере уже есть самодельная база знаний
+
+Прошлый запуск (или агент) мог собрать свою базу знаний вместо пакета: SQLite с векторами,
+sqlite-vec, Chroma, свой MCP или навык поиска, под любым названием. inventory.py и
+`bootstrap.py --inspect` показывают кандидатов в `otherKnowledgeBases`: MCP-записи профилей
+(`kind: mcp`), навыки (`kind: skill`), файлы баз с векторами (`kind: sqlite`) и файлы SQLite,
+которые не удалось прочитать безопасно — слишком большие или менялись во время чтения
+(`kind: sqlite-unchecked`, проверь их по их настройкам сам; только имена
+таблиц и число строк — содержимое не читается; файл базы не открывается на месте, считается
+его временная копия). Это кандидаты: прежде чем что-то предлагать, проверь по её настройкам
+или скрипту, что это действительно база знаний. Если я знаю её название (например, из
+прошлого отчёта Codex), сверь с этим списком.
+
+Порядок:
+
+1. **Ничего не удаляй, не перемещай и не меняй** в этой базе, её папке, MCP-записи и навыке.
+   Читать можно только её устройство и счётчики, без вывода текстов в чат.
+2. Поставь и проверь штатную базу этого пакета (раздел 4 или 11) полностью, как будто
+   самодельной нет.
+3. Скажи мне, что нашёл: название, где лежит, сколько в ней документов (по счётчикам), какие
+   папки она индексировала (по её настройкам или скрипту), каким агентам подключена.
+4. **Если в ней есть документы.** Если они взяты из папок на диске — добавь эти папки в
+   `roots` settings.json (свой `project`, например `__skills__` для навыков или имя
+   проекта) и проиндексируй: штатная база прочитает исходники сама. Если тексты есть только
+   внутри её базы — только с моего согласия выгрузи их как текст (без векторов) в
+   `TOOLING/imported/<название>/` по одному .md на документ, зарегистрируй эту папку в `roots`
+   с `project: imported-<название>` и проиндексируй. Сверь число документов до и после
+   и покажи мне.
+5. **Если она пустая** — переносить нечего. Пустой считай её, только если у её записи
+   `kind: sqlite` стоит `rowsKnown: true` и во всех таблицах 0. Если `rowsKnown: false`
+   (`sqlite-unchecked`), в списке есть `scan-incomplete` или запись `mcp`/`skill` без файла базы — содержимое
+   неизвестно: не называй её пустой, скажи мне и разберись по её настройкам, где она хранит
+   данные (только чтение).
+6. Затем предложи мне отключить самоделку, чтобы агенты искали только через
+   `agent_kb_search`. Только после моего «да»: сохрани копию config.yaml профиля и поставь
+   её MCP-записи `enabled: false` (саму запись не удаляй); навык-самоделку перенеси в
+   `TOOLING/disabled-skills/<профиль>/<навык>` (не удаляй). Файл её базы оставь на месте.
+   Скажи мне, как вернуть всё обратно. Если я отказался — оставь как есть и запиши в отчёт,
+   что у агентов две базы знаний.
+7. В tooling/report.md: что нашёл, что перенёс (числа), что отключил и как вернуть.

@@ -242,9 +242,12 @@ class ScanBudget:
         return not self.exhausted
 
 
-# Internal tables SQLite virtual tables create for themselves (FTS5, sqlite-vec, sqlite-vss).
-SHADOW_SUFFIX=re.compile(r'_(data|idx|content|docsize|config|chunks|rowids|info|index|auxiliary|'
-                         r'vector_chunks\d+|metadatachunks\d+|metadatatext\d+)$')
+# Internal tables each virtual-table module creates for itself, by module. A table of an
+# unknown module is counted: counting too much can never make a full base look empty.
+SHADOW_TABLES={'fts5':r'data|idx|content|docsize|config','fts4':r'content|segments|segdir|docsize|stat',
+               'fts3':r'content|segments|segdir|docsize|stat','rtree':r'node|parent|rowid',
+               'vec0':r'chunks|rowids|info|auxiliary|vector_chunks\d+|metadatachunks\d+|metadatatext\d+',
+               'vss0':r'index|data'}
 
 
 def copy_bounded(source,target,deadline,clock):
@@ -303,13 +306,16 @@ def sqlite_summary(path,attempts=3,budget=None):
             if {'kb_meta','chunks','documents'}<=names:return None  # this package's own base
             vector=[n for n,sql in rows if VECTOR_SQL.search(sql or '')]
             if not vector:return None
-            virtual=[n for n,sql in rows if re.match(r'(?is)\s*create\s+virtual\s+table',sql or '')]
+            virtual={}
+            for n,sql in rows:
+                module=re.match(r'(?is)\s*create\s+virtual\s+table\s+.*?\s+using\s+(\w+)',sql or '')
+                if module and module.group(1).lower() in SHADOW_TABLES:virtual[n]=SHADOW_TABLES[module.group(1).lower()]
             tables={};known=True
             for name,sql in rows:
                 # Only the known internal tables of a virtual table (docs_data, vec_chunks...) are
                 # left out; every other table, docs_archive included, is counted.
-                if name.startswith('sqlite_') or any(name.startswith(v+'_') and SHADOW_SUFFIX.fullmatch(name[len(v):])
-                                                     for v in virtual):continue
+                if name.startswith('sqlite_') or any(name.startswith(v+'_') and re.fullmatch('(?:'+suffixes+')',name[len(v)+1:])
+                                                     for v,suffixes in virtual.items()):continue
                 try:tables[name]=db.execute('select count(*) from "'+name.replace('"','""')+'"').fetchone()[0]
                 except sqlite3.Error:tables[name]=None;known=False
             return {'rowsKnown':known,'tables':tables,'vectorTables':sorted(vector)}
@@ -363,10 +369,12 @@ def foreign_knowledge_bases(home,profiles,yaml=None,budget=None):
     # The profiles inventory actually found (also %LOCALAPPDATA%\\hermes or a custom --hermes-home).
     bases=[home/'InfobizAgents',*[Path(p['path']) for p in profiles],
            *[p for p in sorted(home.glob('*')) if p.is_dir() and not p.is_symlink() and KB_HINT.search(p.name)]]
-    hermes_areas=[os.path.normcase(str(Path(p['path']))) for p in profiles]
+    hermes_areas=[Path(os.path.normcase(str(Path(p['path']).absolute()))) for p in profiles]
     for base in bases:
         for here,dirs,files in walk_limited(base,4,budget):
-            in_hermes=any(os.path.normcase(str(here)).startswith(a) for a in hermes_areas)
+            # Path components, not text: profiles/tech-kb is not inside profiles/tech.
+            spot=Path(os.path.normcase(str(here.absolute())))
+            in_hermes=any(spot==a or a in spot.parents for a in hermes_areas)
             if here.name=='tooling' and (here/'student_tools.py').is_file():
                 dirs[:]=[d for d in dirs if d!='kb']
             for name in files:

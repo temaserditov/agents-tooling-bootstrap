@@ -1012,5 +1012,24 @@ class ForeignKnowledgeBases(unittest.TestCase):
             budget=self.inventory.ScanBudget(seconds=-1)
             self.assertEqual(self.inventory.sqlite_summary(base,budget=budget)['reason'],'time-limit');self.assertTrue(budget.exhausted)
 
+    def test_shadow_tables_belong_to_their_module(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as tmp:
+            home=Path(tmp).resolve();folder=home/'InfobizAgents/x';folder.mkdir(parents=True)
+            db=sqlite3.connect(folder/'kb.db');db.execute('create virtual table docs using fts5(body)')
+            for extra in ('docs_chunks','docs_info'):
+                db.execute(f'create table {extra}(id integer primary key,embedding blob)');db.execute(f"insert into {extra}(embedding) values(x'00')")
+            db.commit();db.close()
+            entry=next(x for x in self.inventory.foreign_knowledge_bases(home,[]) if x['kind']=='sqlite')
+            self.assertEqual(entry['tables'],{'docs':0,'docs_chunks':1,'docs_info':1})
+
+    def test_a_neighbour_of_a_profile_is_not_inside_it(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as tmp:
+            home=Path(tmp).resolve();hermes=home/'InfobizAgents/hermes/profiles';(hermes/'tech').mkdir(parents=True)
+            (hermes/'tech-kb').mkdir();db=sqlite3.connect(hermes/'tech-kb/projects.db');db.execute('create table t(embedding blob)');db.commit();db.close()
+            found=self.inventory.foreign_knowledge_bases(home,[{'id':'tech','path':str(hermes/'tech')}])
+            self.assertEqual([Path(x['path']).name for x in found if x['kind']=='sqlite'],['projects.db'])
+
 
 if __name__=='__main__':unittest.main()

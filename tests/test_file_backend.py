@@ -28,6 +28,17 @@ def load(name,file):
 tools=load('student_tools_file','student_tools.py')
 
 
+def launchctl_print(plist_path):
+    """What `launchctl print` shows for a loaded job (path, interval, arguments)."""
+    import plistlib
+    body=plistlib.loads(Path(plist_path).read_bytes())
+    lines=['gui/501/'+body['Label']+' = {','\tactive count = 0','\tpath = '+str(plist_path),'\ttype = LaunchAgent',
+           '\tstate = not running','\tprogram = '+body['ProgramArguments'][0],'\targuments = {',
+           *['\t\t'+a for a in body['ProgramArguments']],'\t}','\tstdout path = /dev/null',
+           '\trun interval = '+str(body['StartInterval'])+' seconds','}']
+    return ('\n'.join(lines)+'\n').encode()
+
+
 def bag_of_words(cfg,texts):
     """Stand-in for bge-m3: deterministic 1024-dim bag of words."""
     out=[]
@@ -602,10 +613,10 @@ class MacFileBackend(unittest.TestCase):
             def launchctl(args,**kw):
                 calls.append(args[1:]);self.assertIs(kw.get('stdin'),subprocess.DEVNULL);self.assertEqual(args[0],'/bin/launchctl')
                 if args[1]=='print':
-                    return subprocess.CompletedProcess(args,0,stdout=('\tpath = '+str(agents/'com.infobizagents.tooling.kb-index.plist')+'\n').encode()) \
-                        if loaded else subprocess.CompletedProcess(args,113,stdout=b'')
+                    return subprocess.CompletedProcess(args,0,stdout=loaded['print']) if loaded else subprocess.CompletedProcess(args,113,stdout=b'')
                 if args[1]=='bootstrap':
-                    self.assertEqual(args[2],'gui/501');loaded['plist']=Path(args[3]).read_bytes();return subprocess.CompletedProcess(args,0)
+                    self.assertEqual(args[2],'gui/501');loaded['plist']=Path(args[3]).read_bytes();loaded['print']=launchctl_print(args[3])
+                    return subprocess.CompletedProcess(args,0)
                 if args[1]=='bootout':loaded.clear();return subprocess.CompletedProcess(args,0)
                 raise AssertionError(args)
             first=tools.schedule_index_mac(settings,5,python=python,run=launchctl,agents_dir=agents,uid=501)
@@ -641,9 +652,9 @@ class MacFileBackend(unittest.TestCase):
             state['calls'].append(args[1]);op=args[1]
             if op in fail:return subprocess.CompletedProcess(args,5,stdout=b'')
             if op=='print':
-                return subprocess.CompletedProcess(args,0,stdout=('path = '+state['loaded']+'\n').encode()) if state['loaded'] \
+                return subprocess.CompletedProcess(args,0,stdout=state['print']) if state['loaded'] \
                     else subprocess.CompletedProcess(args,113,stdout=b'')
-            if op=='bootstrap':state['loaded']=args[3];return subprocess.CompletedProcess(args,0)
+            if op=='bootstrap':state['loaded']=args[3];state['print']=launchctl_print(args[3]);return subprocess.CompletedProcess(args,0)
             if op=='bootout':state['loaded']=None;return subprocess.CompletedProcess(args,0)
         return state,run
 
@@ -667,7 +678,7 @@ class MacFileBackend(unittest.TestCase):
             # a refused bootout changes nothing
             _,stuck=self.launchctl_fake(agents,fail=('bootout',))
             def stuck_loaded(args,**kw):
-                if args[1]=='print':return subprocess.CompletedProcess(args,0,stdout=('path = '+str(plist)+'\n').encode())
+                if args[1]=='print':return subprocess.CompletedProcess(args,0,stdout=launchctl_print(plist))
                 return stuck(args,**kw)
             with self.assertRaises(tools.StudentFacingError):
                 tools.schedule_index_mac(settings,15,python=python,run=stuck_loaded,agents_dir=agents,uid=501)
@@ -702,6 +713,51 @@ class MacFileBackend(unittest.TestCase):
                 with self.assertRaises(tools.StudentFacingError):tools.main()
             body=json.loads(status.read_text(encoding='utf-8'))
             self.assertEqual(body['status'],'index-failed');self.assertNotEqual(body['runId'],'old')
+
+    def test_no_change_only_when_launchd_runs_this_definition(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp).resolve();settings=root/'settings.json';settings.write_text('{}');python=root/'python';python.write_bytes(b'')
+            agents=root/'LaunchAgents';state,run=self.launchctl_fake(agents)
+            tools.schedule_index_mac(settings,5,python=python,run=run,agents_dir=agents,uid=501)
+            stale=state['print']
+            # The file on disk says 10 minutes, launchd still runs the 5-minute job.
+            body,_=tools.launch_agent_plist(python,settings,10);(agents/'com.infobizagents.tooling.kb-index.plist').write_bytes(body)
+            state['print']=stale
+            self.assertTrue(tools.schedule_index_mac(settings,10,python=python,run=run,agents_dir=agents,uid=501)['changed'])
+            self.assertIn(b'run interval = 600 seconds',state['print'])
+
+    def test_failed_restore_is_reported_honestly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp).resolve();settings=root/'settings.json';settings.write_text('{}');python=root/'python';python.write_bytes(b'')
+            agents=root/'LaunchAgents';state,run=self.launchctl_fake(agents)
+            tools.schedule_index_mac(settings,5,python=python,run=run,agents_dir=agents,uid=501)
+            def broken(args,**kw):
+                if args[1]=='bootstrap':return subprocess.CompletedProcess(args,5)
+                return run(args,**kw)
+            with self.assertRaises(tools.StudentFacingError) as caught:
+                tools.schedule_index_mac(settings,10,python=python,run=broken,agents_dir=agents,uid=501)
+            self.assertIn('НЕ загружена',str(caught.exception))
+
+    def test_unreadable_launchctl_state_changes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp).resolve();settings=root/'settings.json';settings.write_text('{}');python=root/'python';python.write_bytes(b'')
+            agents=root/'LaunchAgents';agents.mkdir()
+            weird=lambda args,**kw:subprocess.CompletedProcess(args,0,stdout=b'something else\n')
+            with self.assertRaises(tools.StudentFacingError):tools.unschedule_index_mac(settings,run=weird,agents_dir=agents,uid=501)
+            with self.assertRaises(tools.StudentFacingError):tools.schedule_index_mac(settings,5,python=python,run=weird,agents_dir=agents,uid=501)
+            self.assertEqual(list(agents.iterdir()),[])
+
+    def test_unschedule_checks_the_loaded_job_when_the_plist_is_gone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp).resolve();python=root/'python';python.write_bytes(b'')
+            new=root/'new/settings.json';new.parent.mkdir();new.write_text('{}')
+            old=root/'old/settings.json';old.parent.mkdir();old.write_text('{}')
+            agents=root/'LaunchAgents';state,run=self.launchctl_fake(agents)
+            tools.schedule_index_mac(new,5,python=python,run=run,agents_dir=agents,uid=501)
+            (agents/'com.infobizagents.tooling.kb-index.plist').unlink()
+            with self.assertRaises(tools.StudentFacingError):tools.unschedule_index_mac(old,run=run,agents_dir=agents,uid=501)
+            self.assertIsNotNone(state['loaded'])
+            self.assertTrue(tools.unschedule_index_mac(new,run=run,agents_dir=agents,uid=501)['changed'])
 
     def test_failed_launchctl_bootstrap_is_reported(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -757,7 +813,7 @@ class MacBackendChoice(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             home=Path(tmp).resolve();uv=home/'.hermes/tools/uv-0.13.5-darwin-arm64/uv';uv.parent.mkdir(parents=True)
             uv.write_text('#!/bin/sh\n');uv.chmod(0o755)
-            self.assertEqual(self.inventory.hermes_uv(home),[str(uv)])
+            self.assertEqual(self.inventory.hermes_uv(home/'.hermes'),[str(uv)])
 
 
 class ForeignKnowledgeBases(unittest.TestCase):
@@ -835,6 +891,50 @@ class ForeignKnowledgeBases(unittest.TestCase):
         out=subprocess.CompletedProcess([],0,stdout='/Users/x/custom/uv-pythons\n')
         self.assertEqual(self.inventory.uv_python_dir('/u/uv',run=lambda *a,**k:out),Path('/Users/x/custom/uv-pythons'))
         self.assertIsNone(self.inventory.uv_python_dir(None))
+
+    def test_every_ordinary_table_is_counted_and_quoted_columns_are_found(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as tmp:
+            home=Path(tmp).resolve();folder=home/'InfobizAgents/x';folder.mkdir(parents=True)
+            db=sqlite3.connect(folder/'a.db');db.execute('create table vectors_data(id integer primary key,embedding blob)')
+            db.execute("insert into vectors_data(embedding) values(x'00')");db.commit();db.close()
+            for i,col in enumerate(('[embedding]','`embedding`','"vector"')):
+                db=sqlite3.connect(folder/f'q{i}.db');db.execute(f'create table t(id integer,{col} blob)');db.commit();db.close()
+            found={Path(x['path']).name:x for x in self.inventory.foreign_knowledge_bases(home,[])}
+            self.assertEqual(found['a.db']['tables'],{'vectors_data':1});self.assertTrue(found['a.db']['rowsKnown'])
+            self.assertEqual({'q0.db','q1.db','q2.db'}<=set(found),True)
+
+    def test_a_large_base_is_an_unchecked_candidate_not_dropped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home=Path(tmp).resolve();folder=home/'InfobizAgents/rag';folder.mkdir(parents=True)
+            (folder/'data.db').write_bytes(b'SQLite format 3\x00'+b'\x00'*100)
+            with patch.object(self.inventory,'SQLITE_COPY_BYTES',10):
+                found=self.inventory.foreign_knowledge_bases(home,[])
+            self.assertEqual([(x['kind'],x['rowsKnown'],x['reason']) for x in found],[('sqlite-unchecked',False,'too-large')])
+
+    def test_budget_is_checked_between_files_of_one_folder(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as tmp:
+            home=Path(tmp).resolve();folder=home/'InfobizAgents/many';folder.mkdir(parents=True)
+            for i in range(5):
+                db=sqlite3.connect(folder/f'{i}.db');db.execute('create table t(embedding blob)');db.commit();db.close()
+            now={'t':0.0}
+            def clock():now['t']+=10;return now['t']
+            found=self.inventory.foreign_knowledge_bases(home,[],budget=self.inventory.ScanBudget(seconds=25,clock=clock))
+            self.assertEqual(found[-1]['kind'],'scan-incomplete');self.assertLess(sum(x['kind']=='sqlite' for x in found),5)
+
+    def test_hermes_own_databases_are_not_candidates(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as tmp:
+            home=Path(tmp).resolve();folder=home/'.hermes/profiles/tech';folder.mkdir(parents=True)
+            db=sqlite3.connect(folder/'state.db');db.execute('create table m(embedding blob)');db.commit();db.close()
+            self.assertEqual(self.inventory.foreign_knowledge_bases(home,[{'id':'tech','path':str(folder)}]),[])
+
+    def test_hermes_uv_follows_the_hermes_home(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp).resolve()/'custom-hermes';uv=root/'tools/uv-0.13.5-darwin-arm64/uv';uv.parent.mkdir(parents=True)
+            uv.write_text('#!/bin/sh\n');uv.chmod(0o755)
+            self.assertEqual(self.inventory.hermes_uv(root),[str(uv)])
 
 
 if __name__=='__main__':unittest.main()

@@ -734,14 +734,15 @@ PY -B student_tools.py fetch-embedding-model --model-dir TOOLING/models/bge-m3-o
 PY -B student_tools.py fetch-embedding-model --model-dir TOOLING/models/bge-m3-onnx
 PY -B student_tools.py --config SETTINGS model-check
 PY -B student_tools.py --config SETTINGS doctor
-PY -B bootstrap.py --hermes-home ~/.hermes --settings SETTINGS --inspect
-PY -B bootstrap.py --hermes-home ~/.hermes --settings SETTINGS
+PY -B bootstrap.py --hermes-home HERMES_HOME --settings SETTINGS --inspect
+PY -B bootstrap.py --hermes-home HERMES_HOME --settings SETTINGS
 PY -B student_tools.py --config SETTINGS index --status-file TOOLING/index-status.json --progress
 PY -B student_tools.py --config SETTINGS search "запрос по-русски" --profile tech --project __skills__
-PY -B bootstrap.py --hermes-home ~/.hermes --settings SETTINGS --index
+PY -B bootstrap.py --hermes-home HERMES_HOME --settings SETTINGS --index
 ```
 
-Всё как в 10.2–10.3: второй fetch — `"changed": false`, несовпадение SHA-256 — ЖЁСТКИЙ ОТКАЗ;
+`HERMES_HOME` — папка Hermes, в которой inventory.py нашёл профили (поле `path` профиля без
+`/profiles/<имя>`; обычно `~/.hermes`). Всё как в 10.2–10.3: второй fetch — `"changed": false`, несовпадение SHA-256 — ЖЁСТКИЙ ОТКАЗ;
 bootstrap сам создаёт схему в `kbFile` (psql, schema.sql, grants.sql не нужны); первую
 индексацию — на переднем плане с `--progress` (на процессоре это может занять часы); последний
 bootstrap с `--index` ничего не переиндексирует. MCP-клиент Hermes, `hermes mcp test` у каждого
@@ -756,6 +757,7 @@ bootstrap с `--index` ничего не переиндексирует. MCP-к�
 PY -B student_tools.py --config SETTINGS schedule-index --interval-minutes 5
 PY -B student_tools.py --config SETTINGS schedule-index --interval-minutes 5
 launchctl print gui/$(id -u)/com.infobizagents.tooling.kb-index
+cat TOOLING/index-status.json
 launchctl kickstart gui/$(id -u)/com.infobizagents.tooling.kb-index
 cat TOOLING/index-status.json
 ```
@@ -765,8 +767,10 @@ schedule-index пишет `~/Library/LaunchAgents/com.infobizagents.tooling.kb-i
 в фоновом режиме с пониженным приоритетом; launchd не запускает второй экземпляр, пока идёт
 первый; после сна Mac догоняет одним запуском; процесс между запусками не висит. Повторный
 schedule-index — `"changed": false`. Запускай его из обычной сессии моего пользователя (в
-которой я вошёл в macOS), не через sudo. Через несколько секунд после kickstart в
-`index-status.json` должно быть `"status": "ok"`. Убрать: `PY -B student_tools.py --config
+которой я вошёл в macOS), не через sudo. Проверка фонового запуска: запомни `runId` в
+`index-status.json` до kickstart и дождись НОВОГО `runId` (с маленьким изменением в материалах —
+секунды, с крупным — дольше); в нём должно быть `"status": "ok"`, а в `launchctl print` —
+`last exit code = 0`. Старый `ok` от ручной индексации фоновый запуск не подтверждает. Убрать: `PY -B student_tools.py --config
 SETTINGS unschedule-index`. Свой LaunchAgent с `watch` для file не делай.
 
 Фоновые процессы macOS не читают папки «Документы», «Рабочий стол», «Загрузки» и iCloud
@@ -789,7 +793,9 @@ Drive без отдельного разрешения. Материалы аг�
 sqlite-vec, Chroma, свой MCP или навык поиска, под любым названием. inventory.py и
 `bootstrap.py --inspect` показывают кандидатов в `otherKnowledgeBases`: MCP-записи профилей
 (`kind: mcp`), навыки (`kind: skill`) и файлы баз с векторами (`kind: sqlite`, только имена
-таблиц и число строк — содержимое не читается). Если я знаю её название (например, из
+таблиц и число строк — содержимое не читается; файл базы не открывается на месте, считается
+его временная копия). Это кандидаты: прежде чем что-то предлагать, проверь по её настройкам
+или скрипту, что это действительно база знаний. Если я знаю её название (например, из
 прошлого отчёта Codex), сверь с этим списком.
 
 Порядок:
@@ -807,7 +813,11 @@ sqlite-vec, Chroma, свой MCP или навык поиска, под любы
    `TOOLING/imported/<название>/` по одному .md на документ, зарегистрируй эту папку в `roots`
    с `project: imported-<название>` и проиндексируй. Сверь число документов до и после
    и покажи мне.
-5. **Если она пустая** (во всех таблицах 0 строк) — переносить нечего.
+5. **Если она пустая** — переносить нечего. Пустой считай её, только если у её записи
+   `kind: sqlite` стоит `rowsKnown: true` и во всех таблицах 0. Если `rowsKnown: false`, в
+   списке есть `scan-incomplete` или запись `mcp`/`skill` без файла базы — содержимое
+   неизвестно: не называй её пустой, скажи мне и разберись по её настройкам, где она хранит
+   данные (только чтение).
 6. Затем предложи мне отключить самоделку, чтобы агенты искали только через
    `agent_kb_search`. Только после моего «да»: сохрани копию config.yaml профиля и поставь
    её MCP-записи `enabled: false` (саму запись не удаляй); навык-самоделку перенеси в

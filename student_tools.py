@@ -1009,13 +1009,19 @@ def file_doctor(cfg):
             'embeddingDimensions':len(vector),'local':True,'warnings':warnings}
 
 
+def write_status(status_file,body):
+    """One small JSON file with the last run (bounded log); runId tells a new run from an old one."""
+    status_file=guard(status_file)
+    stage=status_file.with_name('.'+status_file.name+'.'+uuid.uuid4().hex[:8])
+    stage.write_text(json.dumps({'finishedAt':time.strftime('%Y-%m-%dT%H:%M:%S%z'),'runId':uuid.uuid4().hex,**body},
+                                ensure_ascii=False),encoding='utf-8')
+    os.replace(stage,status_file)
+
+
 def index_with_status(cfg,status_file,progress=None):
     """index() for the scheduled task: the last result goes to one small JSON file (bounded log)."""
     status_file=guard(status_file)
-    def write(body):
-        stage=status_file.with_name('.'+status_file.name+'.'+uuid.uuid4().hex[:8])
-        stage.write_text(json.dumps({'finishedAt':time.strftime('%Y-%m-%dT%H:%M:%S%z'),**body},ensure_ascii=False),encoding='utf-8')
-        os.replace(stage,status_file)
+    def write(body):write_status(status_file,body)
     try:result=file_index(cfg,progress) if cfg.get('backend')=='file' else index(cfg)
     except StudentFacingError as error:write({'status':'index-failed','errorClass':'StudentFacingError','message':str(error)});raise
     except Exception as error:write({'status':'index-pending','errorClass':type(error).__name__});raise
@@ -1133,11 +1139,30 @@ def launchctl(run,*args):
     return run(['/bin/launchctl',*args],capture_output=True,stdin=subprocess.DEVNULL)
 
 
+def loaded_plist(run,target):
+    """The plist path launchd loaded the job from, '' when it is not loaded, None if unknown."""
+    done=launchctl(run,'print',target)
+    if done.returncode:return ''
+    out=done.stdout.decode('utf-8','replace') if isinstance(done.stdout,bytes) else (done.stdout or '')
+    found=re.search(r'(?m)^\s*path = (.+)$',out)
+    return found.group(1).strip() if found else None
+
+
+def plist_settings(plist):
+    """--config of a LaunchAgent plist written by this package, or None."""
+    import plistlib
+    try:args=plistlib.loads(Path(plist).read_bytes()).get('ProgramArguments',[])
+    except Exception:return None
+    return args[args.index('--config')+1] if '--config' in args[:-1] else None
+
+
 def schedule_index_mac(settings,interval_minutes=5,python=None,run=subprocess.run,agents_dir=None,uid=None):
     """Mac: ~/Library/LaunchAgents/com.infobizagents.tooling.kb-index.plist of this user.
 
     launchd starts `index` every N minutes and never a second copy while one runs; a sleeping
     Mac catches up once after waking. No administrator, no daemon, no resident process.
+    A failed reload puts the previous definition back, so a repeat never reports a job that
+    launchd does not run.
     """
     check_interval(interval_minutes)
     settings=guard(settings)
@@ -1150,31 +1175,45 @@ def schedule_index_mac(settings,interval_minutes=5,python=None,run=subprocess.ru
     target=f'gui/{uid}/{INDEX_AGENT_LABEL}'
     result={'task':INDEX_AGENT_LABEL,'plist':str(plist),'intervalMinutes':interval_minutes,'statusFile':str(status),
             'runNow':'launchctl kickstart '+target}
-    loaded=launchctl(run,'print',target).returncode==0
-    if loaded and plist.is_file() and plist.read_bytes()==body:return {'changed':False,**result}
+    source=loaded_plist(run,target)
+    if source==str(plist) and plist.is_file() and plist.read_bytes()==body:return {'changed':False,**result}
+    previous=plist.read_bytes() if plist.is_file() else None
     agents.mkdir(parents=True,exist_ok=True)
-    # launchd refuses a plist that others can write.
-    stage=plist.with_name('.'+plist.name+'.'+uuid.uuid4().hex[:8]);stage.write_bytes(body);stage.chmod(0o644)
-    if loaded:launchctl(run,'bootout',target)
-    os.replace(stage,plist)
+    if source!='' and launchctl(run,'bootout',target).returncode:
+        raise StudentFacingError('launchctl не выгрузил прежнюю задачу '+INDEX_AGENT_LABEL+'; ничего не изменено.')
+    def write(data):
+        # launchd refuses a plist that others can write.
+        stage=plist.with_name('.'+plist.name+'.'+uuid.uuid4().hex[:8]);stage.write_bytes(data);stage.chmod(0o644);os.replace(stage,plist)
+    write(body)
     done=launchctl(run,'bootstrap',f'gui/{uid}',str(plist))
     if done.returncode:
-        raise StudentFacingError(f'launchctl не загрузил {INDEX_AGENT_LABEL} (код {done.returncode}). Запусти от пользователя, '
-                                 'который вошёл в macOS и от которого работают агенты; права администратора не нужны.')
+        if previous is not None:
+            write(previous);launchctl(run,'bootstrap',f'gui/{uid}',str(plist))
+        else:plist.unlink()
+        raise StudentFacingError(f'launchctl не загрузил {INDEX_AGENT_LABEL} (код {done.returncode}); прежнее состояние '
+                                 'возвращено. Запусти от пользователя, который вошёл в macOS и от которого работают агенты; '
+                                 'права администратора не нужны.')
     return {'changed':True,**result}
 
 
 def unschedule_index_mac(settings,run=subprocess.run,agents_dir=None,uid=None):
-    guard(settings)
+    """Removes the LaunchAgent only when it belongs to these settings (a moved install keeps its job)."""
+    settings=guard(settings)
     uid=os.getuid() if uid is None else uid
     agents=Path(agents_dir) if agents_dir else Path.home()/'Library/LaunchAgents'
     plist=guard(agents/(INDEX_AGENT_LABEL+'.plist'));target=f'gui/{uid}/{INDEX_AGENT_LABEL}'
-    loaded=launchctl(run,'print',target).returncode==0
+    owner=plist_settings(plist) if plist.is_file() else None
+    if plist.is_file() and owner!=str(settings):
+        raise StudentFacingError('Задача '+INDEX_AGENT_LABEL+' принадлежит другой установке пакета ('+str(owner)+'); '
+                                 'я её не снимаю. Выполни unschedule-index с её settings.json.')
+    loaded=loaded_plist(run,target)
+    if loaded not in ('',None,str(plist)):
+        raise StudentFacingError('Задача '+INDEX_AGENT_LABEL+' загружена не из '+str(plist)+'; я её не снимаю.')
     if loaded and launchctl(run,'bootout',target).returncode:
         raise StudentFacingError('launchctl не выгрузил '+INDEX_AGENT_LABEL+'.')
     existed=plist.is_file()
     if existed:plist.unlink()
-    return {'changed':loaded or existed,'task':INDEX_AGENT_LABEL}
+    return {'changed':bool(loaded) or existed,'task':INDEX_AGENT_LABEL}
 
 
 def unschedule_index(settings,run=subprocess.run,windows=None,mac=None):
@@ -1365,7 +1404,14 @@ def main():
     if a.command=='transcribe':print(dump_json(transcribe(a.model_dir,a.audio,a.output),ensure_ascii=False));return
     if a.command=='fetch-whisper-model':print(dump_json(fetch_whisper_model(a.model_dir),ensure_ascii=False));return
     if a.command=='fetch-embedding-model':print(dump_json(fetch_embedding_model(a.model_dir),ensure_ascii=False));return
-    cfg=config(a.config)
+    try:cfg=config(a.config)
+    except Exception as error:
+        # A scheduled run must leave a fresh status even when settings are refused.
+        if a.command=='index' and a.status_file:
+            body={'status':'index-failed','errorClass':type(error).__name__}
+            if isinstance(error,StudentFacingError):body['message']=str(error)
+            write_status(a.status_file,body)
+        raise
     if a.command=='model-check':print(dump_json(model_check(cfg)));return
     if a.command=='index':
         progress=None

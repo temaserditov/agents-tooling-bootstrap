@@ -99,7 +99,7 @@ def without_block(text):
 def prepare(hermes_home,settings,via_vault=False,initial_index=False,enable_browser=False):
     import yaml
     root=safe(hermes_home);settings=safe(settings)
-    state=inventory.scan(hermes_home=root)
+    state=inventory.scan(hermes_home=root,foreign=False)
     if not state['profiles']:raise BootstrapError('Не найдены установленные профили агентов курса. Дооснащение ставится только поверх установленных агентов.')
     # Explicit encodings: on Windows the default is the ANSI code page and would garble Cyrillic.
     cfg=json.loads(settings_text(settings))

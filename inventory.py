@@ -124,8 +124,9 @@ def windows_arm64():
 # path on macOS 15. Everything else that can run it takes backend file (no services).
 MAC_POSTGRES_VERIFIED=(15,)
 MAC_FILE_MIN_MAJOR=14
-VENV_PYTHON_CHECK=('import sys,sqlite3,venv,ensurepip;'
+VENV_PYTHON_CHECK=('import sys,sqlite3,venv,ensurepip,platform;'
                    'assert (3,11)<=sys.version_info[:2]<=(3,13);'
+                   'assert platform.machine()=="arm64";'
                    'sqlite3.connect(":memory:").execute("create virtual table t using fts5(x)")')
 
 
@@ -162,14 +163,23 @@ def mac_kb_backend(major,silicon,homebrew):
     return 'file','macos-newer-than-verified-postgres'
 
 
-def venv_pythons(home):
-    """Interpreters for the package venv (3.11-3.13, venv+pip, SQLite with FTS5), best first.
+def uv_python_dir(uv,run=subprocess.run):
+    """Where this uv installs Pythons (UV_PYTHON_INSTALL_DIR, XDG_DATA_HOME honoured), or None."""
+    if not uv:return None
+    try:out=run([str(uv),'python','dir'],capture_output=True,text=True,stdin=subprocess.DEVNULL,timeout=20).stdout.strip()
+    except (OSError,subprocess.SubprocessError):return None
+    return Path(out) if out and Path(out).is_absolute() else None
+
+
+def venv_pythons(home,uv=None):
+    """Interpreters for the package venv (3.11-3.13 arm64, venv+pip, SQLite with FTS5), best first.
 
     uv-managed Python first: it does not move when Hermes updates its own runtime.
     """
     found=[];seen=set()
-    patterns=[(home/'.local/share/uv/python','cpython-3.1[23]*-macos-aarch64-none/bin/python3.1[23]'),
-              (home/'.local/share/uv/python','cpython-3.11*-macos-aarch64-none/bin/python3.11'),
+    stores=[d for d in (uv_python_dir(uv),home/'.local/share/uv/python') if d]
+    patterns=[*[(d,'cpython-3.1[23]*-macos-aarch64-none/bin/python3.1[23]') for d in stores],
+              *[(d,'cpython-3.11*-macos-aarch64-none/bin/python3.11') for d in stores],
               (Path('/Library/Frameworks/Python.framework/Versions'),'3.1[123]/bin/python3.1[123]'),
               (Path('/opt/homebrew/bin'),'python3.1[123]')]
     for base,pattern in patterns:
@@ -193,10 +203,10 @@ def mac_state(home):
     brew=Path('/opt/homebrew/bin/brew') if silicon else Path('/usr/local/bin/brew')
     homebrew=str(brew) if brew.is_file() else None
     backend,reason=mac_kb_backend(major,silicon,homebrew)
+    uv=shutil.which('uv') or next(iter(hermes_uv(home)),None)
     return {'macosVersion':version,'macosMajor':major,'appleSilicon':silicon,
             'pythonNativeArm64':platform.machine()=='arm64','homebrew':homebrew,
-            'kbBackend':backend,'kbBackendReason':reason,'venvPythonCandidates':venv_pythons(home),
-            'uv':shutil.which('uv') or next(iter(hermes_uv(home)),None)}
+            'kbBackend':backend,'kbBackendReason':reason,'venvPythonCandidates':venv_pythons(home,uv),'uv':uv}
 
 
 # Another knowledge base an agent (or an earlier Codex run) built on its own: FOR-CODEX.md,
@@ -204,52 +214,90 @@ def mac_state(home):
 KB_HINT=re.compile(r'(?i)sqlite[-_]?vec|\bvec0\b|sqlite[-_]?vss|\bvss0\b|chromadb|lancedb|\bfaiss\b|qdrant|embedding|'
                    r'vector|knowledge[-_ ]?base|\bkb\b|\brag\b|farvater|фарватер|векторн|база знаний')
 SKILL_HINT=re.compile(r'(?i)sqlite[-_]?vec|\bvec0\b|\bvss0\b|chromadb|lancedb|\bfaiss\b|farvater|фарватер')
-VECTOR_SQL=re.compile(r'(?i)using\s+(vec0|vss0|vss)|embedding|vector')
+# A real vector store: a vec0/vss virtual table, or a column named embedding(s)/vector(s).
+VECTOR_SQL=re.compile(r'(?i)using\s+(vec0|vss0|vss)\b|[(,]\s*"?(embedding|embeddings|vector|vectors)"?\s+(blob|f32_blob|float|real|text|json)\b'
+                      r'|[(,]\s*"?(embedding|embeddings|vector|vectors)"?\s*[,)]')
 FOREIGN_SKIP={'node_modules','.git','.cache','cache','logs','sessions','backups','integration-backups',
               'venv','.venv','site-packages','browser-profile-tooling','models','Library','.Trash'}
 DB_SUFFIXES=('.sqlite','.sqlite3','.db')
+# Bounds of the scan: it runs before anything is installed and must never hang.
+SCAN_SECONDS=20
+SCAN_FILES=20000
+SQLITE_COPY_BYTES=256*1024*1024
+SQLITE_SECONDS=3
+SKILL_READ_BYTES=20000
+
+
+class ScanBudget:
+    def __init__(self,seconds=SCAN_SECONDS,files=SCAN_FILES,clock=None):
+        import time
+        self.clock=clock or time.monotonic;self.deadline=self.clock()+seconds;self.files=files;self.exhausted=False
+    def spend(self,count=1):
+        self.files-=count
+        if self.files<0 or self.clock()>self.deadline:self.exhausted=True
+        return not self.exhausted
 
 
 def sqlite_summary(path):
-    """Read-only: tables and row counts of a database that stores vectors, else None."""
-    import sqlite3
-    from urllib.parse import quote
-    uri='file:'+quote(str(path))+'?mode=ro';extra={}
+    """Tables and row counts of a database that stores vectors, else None. Never touches the original.
+
+    SQLite opens even read-only WAL bases with side effects (-shm/-wal files), so the main file
+    and its -wal are copied into a private temporary folder and only the copy is opened; the
+    copy includes the WAL, so rows not yet checkpointed are counted too. Whatever cannot be
+    read safely is reported as contents unknown, never as empty.
+    """
+    import sqlite3,tempfile,time
+    path=Path(path);wal=Path(str(path)+'-wal')
+    unknown={'rowsKnown':False,'tables':{}}
     try:
-        db=sqlite3.connect(uri,uri=True,timeout=2);rows=db.execute("select name,sql from sqlite_master where type='table'").fetchall()
-    except sqlite3.Error:
-        # A WAL base without a -shm file opens read-only only as immutable (the -wal part unread).
+        size=path.stat().st_size+(wal.stat().st_size if wal.is_file() else 0)
+    except OSError:return {**unknown,'reason':'unreadable'} if KB_HINT.search(path.name) else None
+    if size>SQLITE_COPY_BYTES:return {**unknown,'reason':'too-large'} if KB_HINT.search(path.name) else None
+    with tempfile.TemporaryDirectory(prefix='agents-inventory-') as tmp:
+        copy=Path(tmp)/'copy.sqlite'
         try:
-            db=sqlite3.connect(uri+'&immutable=1',uri=True,timeout=2);extra={'walNotRead':True}
+            shutil.copyfile(path,copy)
+            if wal.is_file():shutil.copyfile(wal,Path(str(copy)+'-wal'))
+            db=sqlite3.connect(str(copy),timeout=1)
+        except (OSError,sqlite3.Error):return {**unknown,'reason':'unreadable'} if KB_HINT.search(path.name) else None
+        deadline=time.monotonic()+SQLITE_SECONDS
+        db.set_progress_handler(lambda:1 if time.monotonic()>deadline else 0,10000)
+        try:
             rows=db.execute("select name,sql from sqlite_master where type='table'").fetchall()
-        except sqlite3.Error:return {'tables':{},'unreadable':True} if KB_HINT.search(path.name) else None
-    try:
-        names={name for name,_ in rows}
-        if {'kb_meta','chunks','documents'}<=names:return None  # this package's own base
-        if not any(VECTOR_SQL.search(sql or '') for _,sql in rows):return None
-        tables={}
-        for name,sql in rows:
-            if name.startswith('sqlite_') or re.search(r'_(data|idx|content|docsize|config|chunks|rowids|info|vector_chunks\d*)$',name):continue
-            try:tables[name]=db.execute('select count(*) from "'+name.replace('"','""')+'"').fetchone()[0]
-            except sqlite3.Error:tables[name]=None
-        return {'tables':tables,'vectorTables':sorted(n for n,sql in rows if re.search(r'(?i)using\s+(vec0|vss0|vss)',sql or '')),**extra}
-    except sqlite3.Error:return {'tables':{},'unreadable':True}
-    finally:db.close()
+            names={name for name,_ in rows}
+            if {'kb_meta','chunks','documents'}<=names:return None  # this package's own base
+            vector=[n for n,sql in rows if VECTOR_SQL.search(sql or '')]
+            if not vector:return None
+            tables={};known=True
+            for name,sql in rows:
+                if name.startswith('sqlite_') or re.search(r'_(data|idx|content|docsize|config|chunks|rowids|info|vector_chunks\d*)$',name):continue
+                try:tables[name]=db.execute('select count(*) from "'+name.replace('"','""')+'"').fetchone()[0]
+                except sqlite3.Error:tables[name]=None;known=False
+            return {'rowsKnown':known,'tables':tables,'vectorTables':sorted(vector)}
+        except sqlite3.Error:return {**unknown,'reason':'unreadable'} if KB_HINT.search(path.name) else None
+        finally:db.close()
 
 
-def walk_limited(base,depth):
+def walk_limited(base,depth,budget=None):
     base=Path(base)
     if not base.is_dir() or base.is_symlink():return
     start=len(base.parts)
     for dirpath,dirs,files in os.walk(base):
         here=Path(dirpath)
+        if budget is not None and not budget.spend(len(files)+1):return
         dirs[:]=sorted(d for d in dirs if d not in FOREIGN_SKIP and not (here/d).is_symlink() and len(here.parts)-start<depth)
         yield here,dirs,files
 
 
-def foreign_knowledge_bases(home,profiles,yaml=None):
+def skill_head(path):
+    try:
+        with open(path,'rb') as handle:return handle.read(SKILL_READ_BYTES).decode('utf-8',errors='replace')
+    except OSError:return None
+
+
+def foreign_knowledge_bases(home,profiles,yaml=None,budget=None):
     """MCP servers, skills and SQLite files that look like a knowledge base not from this package."""
-    found=[]
+    found=[];budget=budget or ScanBudget()
     if yaml is None:
         try:import yaml
         except ImportError:yaml=False
@@ -265,30 +313,32 @@ def foreign_knowledge_bases(home,profiles,yaml=None):
                 if KB_HINT.search(text):
                     found.append({'kind':'mcp','profile':profile['id'],'name':name,
                                   'enabled':not (isinstance(entry,dict) and entry.get('enabled') is False)})
-        for here,dirs,files in walk_limited(folder/'skills',3):
+        for here,dirs,files in walk_limited(folder/'skills',3,budget):
             if 'SKILL.md' in files:
-                try:text=(here/'SKILL.md').read_text(encoding='utf-8',errors='replace')[:20000]
-                except OSError:continue
-                head=here.name+' '+text
-                if SKILL_HINT.search(head) or \
+                text=skill_head(here/'SKILL.md')
+                if text is None:continue
+                if SKILL_HINT.search(here.name+' '+text) or \
                    (KB_HINT.search(here.name) and re.search(r'(?i)embedding|вектор',text)):
                     found.append({'kind':'skill','profile':profile['id'],'name':here.name,'path':str(here)})
     seen=set()
-    bases=[home/'InfobizAgents',home/'.hermes/profiles',*[p for p in sorted(home.glob('*')) if p.is_dir() and KB_HINT.search(p.name)]]
+    # The profiles inventory actually found (also %LOCALAPPDATA%\\hermes or a custom --hermes-home).
+    bases=[home/'InfobizAgents',*[Path(p['path']) for p in profiles],
+           *[p for p in sorted(home.glob('*')) if p.is_dir() and not p.is_symlink() and KB_HINT.search(p.name)]]
     for base in bases:
-        for here,dirs,files in walk_limited(base,4):
+        for here,dirs,files in walk_limited(base,4,budget):
             if here.name=='tooling' and (here/'student_tools.py').is_file():
                 dirs[:]=[d for d in dirs if d!='kb']
             for name in files:
                 if not name.lower().endswith(DB_SUFFIXES):continue
-                path=here/name;key=str(path)
+                path=here/name;key=os.path.normcase(str(path))
                 if key in seen or path.is_symlink():continue
                 seen.add(key);summary=sqlite_summary(path)
-                if summary:found.append({'kind':'sqlite','path':key,'bytes':path.stat().st_size,**summary})
+                if summary:found.append({'kind':'sqlite','path':str(path),'bytes':path.stat().st_size,**summary})
+    if budget.exhausted:found.append({'kind':'scan-incomplete','reason':'time-or-file-limit'})
     return found
 
 
-def scan(home=None,hermes_home=None):
+def scan(home=None,hermes_home=None,foreign=True):
     home=Path(home) if home is not None else Path.home()
     # Windows: the official Hermes lives in %LOCALAPPDATA%\\hermes (Windows v3); the
     # nested .hermes is the layout of older Windows helpers.
@@ -317,9 +367,10 @@ def scan(home=None,hermes_home=None):
     shell=home/'InfobizAgents/web-shell'
     extra={'windowsArm64':windows_arm64()} if platform.system()=='Windows' else {}
     if platform.system()=='Darwin':extra={'mac':mac_state(home)}
-    try:foreign=foreign_knowledge_bases(home,profiles)
-    except Exception as error:foreign=[{'kind':'scan-failed','errorClass':type(error).__name__}]
-    return {**extra,'schemaVersion':1,'otherKnowledgeBases':foreign,'os':platform.system(),'architecture':platform.machine(),
+    if foreign:
+        try:extra['otherKnowledgeBases']=foreign_knowledge_bases(home,profiles)
+        except Exception as error:extra['otherKnowledgeBases']=[{'kind':'scan-failed','errorClass':type(error).__name__}]
+    return {**extra,'schemaVersion':1,'os':platform.system(),'architecture':platform.machine(),
             'freeDiskBytes':shutil.disk_usage(home).free,'profiles':profiles,
             'hermesVersion':version,'browserMode':browser_mode(version),'hermesMcpClient':mcp_client,'hermesPython':str(hermes_py) if hermes_py else None,
             'commands':{name:shutil.which(name) for name in COMMANDS},

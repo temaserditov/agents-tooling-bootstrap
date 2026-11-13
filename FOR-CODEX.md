@@ -679,6 +679,11 @@ Hermes (`%LOCALAPPDATA%\hermes\installs\...\venv\Scripts\python.exe`); inventory
 | `no-homebrew` | macOS 15 без Homebrew в `/opt/homebrew` |
 | `intel-mac-unsupported`, `macos-older-than-14-unsupported` (`kbBackend: null`) | база знаний не ставится: остановись и скажи мне |
 
+Если на этом Mac база знаний этого пакета уже стоит на PostgreSQL от прошлого выпуска и
+`doctor` с её settings.json проходит, а агенты находят через `agent_kb_search` — ничего не
+переводи на `file`: оставь работающую базу и обнови пакет по разделу 2 («Обновление с прошлого
+выпуска»). Раздел 11 — для новой установки или когда PostgreSQL не встал.
+
 **Что это.** То же, что на Windows (раздел 10, «Почему здесь по-другому»): модель bge-m3,
 1024 измерения, официальный ONNX-экспорт `BAAI/bge-m3` ревизии
 `5617a9f61b028005a4858fdac845db406aefb181`, считается внутри процесса `student_tools.py`
@@ -695,11 +700,13 @@ Hermes (`%LOCALAPPDATA%\hermes\installs\...\venv\Scripts\python.exe`); inventory
 
 ### 11.1. Python и venv
 
-Нужен Python 3.11–3.13 для arm64 с SQLite FTS5. inventory.py уже проверил подходящие и
-перечислил их в `mac.venvPythonCandidates` (лучший первый). Если список пуст и есть `uv`
-(поле `commands.uv`), выполни `uv python install 3.12` и снова запусти inventory.py.
-Если нет ни того ни другого — скажи мне (официальный установщик python.org требует моего
-пароля администратора). Python самого Hermes (`hermesPython`) для venv пакета не используй:
+Нужен Python 3.11–3.13 для arm64 с SQLite FTS5 (3.14 не подходит: под него нет закреплённых
+сборок). inventory.py уже проверил подходящие и перечислил их в `mac.venvPythonCandidates`
+(лучший первый). Если список пуст — возьми `uv` из поля `mac.uv` (его ставит сам Hermes, обычно
+`~/.hermes/tools/uv-<версия>-darwin-arm64/uv`), выполни `UV python install 3.12` (UV — этот
+путь; Python ставится в папку моего пользователя, без пароля) и снова запусти inventory.py.
+Если и `mac.uv` пустой — скажи мне (официальный установщик python.org требует моего пароля
+администратора). Python самого Hermes (`hermesPython`) для venv пакета не используй:
 он меняется при обновлении Hermes. Системный `/usr/bin/python3` (3.9) не подходит.
 
 `TOOLING` — `~/InfobizAgents/tooling` (абсолютный путь), `BASE` — первый из

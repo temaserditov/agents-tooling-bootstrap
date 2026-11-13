@@ -670,6 +670,25 @@ class MacBackendChoice(unittest.TestCase):
         with patch.object(self.inventory.platform,'mac_ver',return_value=('15.6','','')):
             self.assertEqual(self.inventory.mac_product_version(run=lambda *a,**k:(_ for _ in ()).throw(OSError())),'15.6')
 
+    def test_hermes_interpreter_of_the_official_mac_installer_is_found(self):
+        inv=self.inventory
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp).resolve()/'hermes'
+            env=root/'installs/670a/environments/2b8d/venv/bin';env.mkdir(parents=True);(env/'python').write_text('')
+            bare=root/'installs/670a/pm-runtime/generations/c92f/bin';bare.mkdir(parents=True);(bare/'python').write_text('')
+            asked=[]
+            def probe(python,code,timeout=60):
+                asked.append(Path(python));return 0 if Path(python)==env/'python' else 1
+            with patch.object(inv,'probe',side_effect=probe):
+                self.assertEqual(inv.hermes_python(root,windows=False),env/'python')
+            self.assertNotIn(bare/'python',asked)  # only venv/bin/python is asked
+
+    def test_uv_shipped_with_hermes_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home=Path(tmp).resolve();uv=home/'.hermes/tools/uv-0.13.5-darwin-arm64/uv';uv.parent.mkdir(parents=True)
+            uv.write_text('#!/bin/sh\n');uv.chmod(0o755)
+            self.assertEqual(self.inventory.hermes_uv(home),[str(uv)])
+
 
 class ForeignKnowledgeBases(unittest.TestCase):
     """A base an agent built on its own is found, read only, and never confused with ours."""

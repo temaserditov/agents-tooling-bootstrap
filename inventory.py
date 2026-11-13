@@ -53,9 +53,10 @@ def probe(python,code,timeout=60):
 def hermes_python(root,windows=None):
     """The interpreter Hermes itself runs on (it imports hermes_cli), or None.
 
-    Mac/Ubuntu: hermes-agent/venv/bin/python (a launcher into the PM store). The official
-    Windows installer keeps it elsewhere under %LOCALAPPDATA%\\hermes, so there every
-    python.exe in the Hermes tree (caches, profiles and node_modules aside) is asked.
+    Course installs on Mac/Ubuntu: hermes-agent/venv/bin/python (a launcher into the PM
+    store). The official installers (Windows, and Mac/Linux since 0.23) keep it under
+    <hermes>/installs/<id>/environments/<id>/venv; there every python in the Hermes tree
+    (caches, profiles and node_modules aside) is asked.
     """
     root=Path(root);windows=platform.system()=='Windows' if windows is None else windows
     candidates=[]
@@ -63,13 +64,17 @@ def hermes_python(root,windows=None):
         if source.is_symlink():continue
         for venv in ('venv','.venv'):
             candidates+=[source/venv/'bin/python',source/venv/'Scripts/python.exe']
-    if windows and root.is_dir() and not root.is_symlink():
-        base=len(root.parts)
-        for dirpath,dirs,files in os.walk(root):
+    walk=root if windows else root/'installs'
+    if walk.is_dir() and not walk.is_symlink():
+        base=len(walk.parts)
+        for dirpath,dirs,files in os.walk(walk):
             here=Path(dirpath)
             dirs[:]=sorted(d for d in dirs if d.lower() not in HERMES_PYTHON_SKIP and len(here.parts)-base<8
                            and not (here/d).is_symlink())
-            if 'python.exe' in files:candidates.append(here/'python.exe')
+            if windows and 'python.exe' in files:candidates.append(here/'python.exe')
+            # POSIX: environments/<id>/venv/bin/python; bare runtime generations fail the probe.
+            if not windows and here.name=='bin' and here.parent.name=='venv' and 'python' in files:
+                candidates.append(here/'python')
     seen=set()
     for python in candidates:
         key=os.path.normcase(str(python))
@@ -177,6 +182,12 @@ def venv_pythons(home):
     return found
 
 
+def hermes_uv(home):
+    """uv shipped with Hermes (~/.hermes/tools/uv-<version>-darwin-arm64/uv), newest first."""
+    found=sorted((home/'.hermes/tools').glob('uv-*/uv'),reverse=True) if (home/'.hermes/tools').is_dir() else []
+    return [str(p) for p in found if p.is_file() and not p.is_symlink() and os.access(p,os.X_OK)]
+
+
 def mac_state(home):
     version=mac_product_version();major=mac_major(version);silicon=apple_silicon()
     brew=Path('/opt/homebrew/bin/brew') if silicon else Path('/usr/local/bin/brew')
@@ -184,7 +195,8 @@ def mac_state(home):
     backend,reason=mac_kb_backend(major,silicon,homebrew)
     return {'macosVersion':version,'macosMajor':major,'appleSilicon':silicon,
             'pythonNativeArm64':platform.machine()=='arm64','homebrew':homebrew,
-            'kbBackend':backend,'kbBackendReason':reason,'venvPythonCandidates':venv_pythons(home)}
+            'kbBackend':backend,'kbBackendReason':reason,'venvPythonCandidates':venv_pythons(home),
+            'uv':shutil.which('uv') or next(iter(hermes_uv(home)),None)}
 
 
 # Another knowledge base an agent (or an earlier Codex run) built on its own: FOR-CODEX.md,
